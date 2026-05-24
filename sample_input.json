@@ -1,0 +1,7 @@
+[
+  {"url": "https://img.youtube.com/vi/dQw4w9WgXcQ/hqdefault.jpg", "advertiser_name": "Acme Corp"},
+  {"url": "https://img.youtube.com/vi/dQw4w9WgXcQ/maxresdefault.jpg", "advertiser_name": "Acme Corp"},
+  {"url": "https://www.youtube.com/watch?v=jNQXAC9IVRw", "advertiser_name": "Beta LLC"},
+  {"url": "https://upload.wikimedia.org/wikipedia/commons/thumb/4/47/PNG_transparency_demonstration_1.png/280px-PNG_transparency_demonstration_1.png", "advertiser_name": "Acme Corp"},
+  {"url": "https://upload.wikimedia.org/wikipedia/commons/thumb/4/47/PNG_transparency_demonstration_1.png/200px-PNG_transparency_demonstration_1.png", "advertiser_name": "Beta LLC"}
+]

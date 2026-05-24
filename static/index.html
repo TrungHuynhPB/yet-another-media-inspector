@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>Media Inspector</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>Media Inspector</h1>
+      <p class="subtitle">Group by brand · verify uncertain ads · swipe or arrow keys</p>
+    </header>
+
+    <section id="upload-section">
+      <form id="upload-form">
+        <label class="file-label">
+          <input type="file" id="file-input" accept=".xlsx,.xls,.csv,.json" required />
+          <span>Choose Excel or JSON file</span>
+        </label>
+        <label>
+          URL column (optional — auto-detected)
+          <input type="text" id="url-column" placeholder="creative_url_supplier" />
+        </label>
+        <button type="submit" id="upload-btn">Upload &amp; Group by brand</button>
+      </form>
+      <p id="upload-status" class="status"></p>
+    </section>
+
+    <section id="review-section" class="hidden">
+      <p id="review-mode-label" class="mode-label"></p>
+      <div class="progress-bar">
+        <div id="progress-fill"></div>
+      </div>
+      <p id="progress-text"></p>
+
+      <div id="card-stack">
+        <div id="card" class="card">
+          <h2 id="card-title" class="group-title"></h2>
+          <p id="card-subtitle" class="card-subtitle hidden"></p>
+          <div id="card-grid" class="thumb-grid" aria-label="Creatives"></div>
+          <div id="card-single" class="card-single hidden" aria-label="Creative"></div>
+          <div class="card-info">
+            <span id="card-count"></span>
+          </div>
+          <div class="swipe-hints">
+            <span id="hint-left" class="hint-left"></span>
+            <span id="hint-right" class="hint-right"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button type="button" id="btn-fault" class="btn-fault"></button>
+        <button type="button" id="btn-ok" class="btn-ok"></button>
+      </div>
+
+      <button type="button" id="export-btn" class="export-btn">Download results (.xlsx)</button>
+    </section>
+
+    <section id="done-section" class="hidden">
+      <h2>Review complete</h2>
+      <p>All items reviewed. Download your annotated spreadsheet.</p>
+      <button type="button" id="export-btn-done" class="export-btn">Download .xlsx</button>
+      <button type="button" id="upload-another-btn" class="upload-another-btn">Upload another file</button>
+    </section>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
