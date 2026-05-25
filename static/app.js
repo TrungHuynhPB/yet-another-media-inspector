@@ -4,6 +4,23 @@ let uncertainItems = [];
 let mode = "individual";
 let cursor = 0;
 let reviewing = false;
+let contextItem = null;
+
+const RING_CIRCUMFERENCE = 2 * Math.PI * 52;
+
+const META_LABELS = {
+  brand: "Brand",
+  advertiser_name: "Advertiser",
+  vendor_brand: "Vendor brand",
+  social_description: "Social description",
+  social_headline_text: "Headline",
+  social_campaign_text: "Campaign text",
+  platform: "Platform",
+  creative_campaign_name: "Campaign name",
+  creative_video_title: "Video title",
+  social_page_name: "Page name",
+  creative_url: "Creative URL",
+};
 
 const $ = (id) => document.getElementById(id);
 
@@ -13,6 +30,7 @@ const doneSection = $("done-section");
 const card = $("card");
 const cardTitle = $("card-title");
 const cardSubtitle = $("card-subtitle");
+const cardHint = $("card-hint");
 const cardGrid = $("card-grid");
 const cardSingle = $("card-single");
 const cardCount = $("card-count");
@@ -78,9 +96,15 @@ function renderBrandGrid(container, items) {
 
     cell.appendChild(img);
     cell.appendChild(overlay);
+    cell._item = item;
     cell.addEventListener("click", (e) => {
       e.stopPropagation();
       toggleImageFault(item, cell);
+    });
+    cell.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openContextMenu(e.clientX, e.clientY, item);
     });
     container.appendChild(cell);
   });
@@ -139,6 +163,34 @@ function setUiForMode() {
   }
 }
 
+function formatAdvertiserSubtitle(text) {
+  if (!text || !String(text).trim()) return "";
+  return String(text).trim();
+}
+
+function setCardHeader({ title, subtitle, hint }) {
+  if (cardTitle) cardTitle.textContent = title || "Unknown brand";
+  const sub = formatAdvertiserSubtitle(subtitle);
+  if (cardSubtitle) {
+    if (sub) {
+      cardSubtitle.textContent = sub;
+      cardSubtitle.classList.remove("hidden");
+    } else {
+      cardSubtitle.textContent = "";
+      cardSubtitle.classList.add("hidden");
+    }
+  }
+  if (cardHint) {
+    if (hint) {
+      cardHint.textContent = hint;
+      cardHint.classList.remove("hidden");
+    } else {
+      cardHint.textContent = "";
+      cardHint.classList.add("hidden");
+    }
+  }
+}
+
 function showCard() {
   reviewing = false;
   const queue = currentQueue();
@@ -164,21 +216,25 @@ function showCard() {
   const items = item.items?.length ? item.items : [];
 
   if (mode === "individual") {
-    cardTitle.textContent = `Advertiser: ${item.title}`;
     const reason =
       item.uncertainReason === "visual_outlier"
-        ? "This creative looks different from others under the same brand label."
-        : item.uncertainReason === "missing_advertiser"
-          ? "No advertiser name on this row."
-          : "Please confirm the brand label matches this creative.";
-    cardSubtitle.textContent = reason;
-    cardSubtitle.classList.remove("hidden");
+        ? "This creative looks different from others in the same brand group."
+        : item.uncertainReason === "missing_brand"
+          ? "No brand on this row."
+          : "Confirm the brand label matches this creative.";
+    setCardHeader({
+      title: item.title || "Unknown brand",
+      subtitle: item.subtitle,
+      hint: reason,
+    });
     cardCount.textContent = `Uncertain ${cursor + 1} of ${uncertainItems.length}`;
     renderSingleImage(cardSingle, items);
   } else {
-    cardTitle.textContent = item.title;
-    cardSubtitle.textContent = "Tap any image to mark it as fault (gray overlay + ✕).";
-    cardSubtitle.classList.remove("hidden");
+    setCardHeader({
+      title: item.title,
+      subtitle: item.subtitle,
+      hint: "Left-click: mark fault · Right-click: inspect media",
+    });
     renderBrandGrid(cardGrid, items);
     updateBrandCountText();
   }
@@ -198,6 +254,219 @@ function showCard() {
 function finishReview() {
   reviewSection.classList.add("hidden");
   doneSection.classList.remove("hidden");
+}
+
+function showLoading(show) {
+  $("loading-overlay").classList.toggle("hidden", !show);
+}
+
+function phaseLabel(phase) {
+  if (phase === "starting" || phase === "receive") return "Starting…";
+  if (phase === "parse") return "Reading spreadsheet…";
+  if (phase === "group") return "Grouping by brand…";
+  if (phase === "done") return "Done!";
+  return "Downloading media…";
+}
+
+function setLoadingProgress(percent, phase, hint, countText) {
+  const pct = Math.max(0, Math.min(100, percent || 0));
+  const ringFill = $("progress-ring-fill");
+  if (ringFill) {
+    ringFill.style.strokeDashoffset = String(RING_CIRCUMFERENCE * (1 - pct / 100));
+  }
+  const bar = $("loading-bar-fill");
+  if (bar) bar.style.width = `${pct}%`;
+  const pctEl = $("loading-percent");
+  if (pctEl) pctEl.textContent = `${Math.round(pct)}%`;
+  const ringWrap = $("progress-ring");
+  if (ringWrap) ringWrap.setAttribute("aria-valuenow", String(Math.round(pct)));
+  const phaseEl = $("loading-phase");
+  if (phase && phaseEl) phaseEl.textContent = phaseLabel(phase) || phase;
+  const hintEl = $("loading-hint");
+  if (hint !== undefined && hint !== "" && hintEl) hintEl.textContent = hint;
+  const countEl = $("loading-count");
+  if (countText !== undefined && countEl) countEl.textContent = countText;
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function hideContextMenu() {
+  $("context-menu").classList.add("hidden");
+  contextItem = null;
+}
+
+function openContextMenu(x, y, item) {
+  contextItem = item;
+  const menu = $("context-menu");
+  menu.classList.remove("hidden");
+  menu.style.left = `${Math.min(x, window.innerWidth - 180)}px`;
+  menu.style.top = `${Math.min(y, window.innerHeight - 48)}px`;
+}
+
+function isVideoUrl(url) {
+  return /\.(mp4|webm|mov|m4v)(\?|$)/i.test(url || "") || /_video\.mp4/i.test(url || "");
+}
+
+function openInspectModal(item) {
+  hideContextMenu();
+  const modal = $("inspect-modal");
+  const mediaEl = $("inspect-media");
+  const metaEl = $("inspect-meta");
+  const url = item.mediaUrl || "";
+  const thumb = item.thumbUrl || url;
+
+  mediaEl.innerHTML = "";
+  if (isVideoUrl(url)) {
+    const video = document.createElement("video");
+    video.controls = true;
+    video.referrerPolicy = "no-referrer";
+    video.src = url;
+    video.poster = thumb !== url ? thumb : "";
+    mediaEl.appendChild(video);
+  } else {
+    const img = document.createElement("img");
+    img.referrerPolicy = "no-referrer";
+    img.src = thumb;
+    if (thumb !== url && url) {
+      img.addEventListener("error", () => { img.src = url; }, { once: true });
+    }
+    mediaEl.appendChild(img);
+  }
+
+  const meta = item.metadata || {};
+  const brandTitle = meta.brand || item.title || "Unknown brand";
+  $("inspect-title").textContent = brandTitle;
+
+  const inspectSub = $("inspect-subtitle");
+  const advLine = formatAdvertiserSubtitle(
+    meta.advertiser_name || item.subtitle
+  );
+  if (inspectSub) {
+    if (advLine) {
+      inspectSub.textContent = advLine;
+      inspectSub.classList.remove("hidden");
+    } else {
+      inspectSub.classList.add("hidden");
+    }
+  }
+
+  metaEl.innerHTML = "";
+  const order = [
+    "brand",
+    "advertiser_name",
+    "platform",
+    "social_headline_text",
+    "social_description",
+    "social_campaign_text",
+    "creative_campaign_name",
+    "creative_video_title",
+    "social_page_name",
+    "creative_url",
+  ];
+  for (const key of order) {
+    if (key === "brand" || key === "advertiser_name") continue;
+    const val = meta[key];
+    if (!val) continue;
+    const dt = document.createElement("dt");
+    dt.textContent = META_LABELS[key] || key;
+    const dd = document.createElement("dd");
+    if (key === "creative_url") {
+      const a = document.createElement("a");
+      a.href = val;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      a.textContent = val;
+      dd.appendChild(a);
+    } else {
+      dd.textContent = val;
+    }
+    metaEl.appendChild(dt);
+    metaEl.appendChild(dd);
+  }
+
+  modal.classList.remove("hidden");
+}
+
+function closeInspectModal() {
+  $("inspect-modal").classList.add("hidden");
+  const mediaEl = $("inspect-media");
+  const video = mediaEl.querySelector("video");
+  if (video) video.pause();
+  mediaEl.innerHTML = "";
+}
+
+function formatBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** Poll job status — reliable progress (streaming often buffers in browsers). */
+async function uploadWithPolling(fd) {
+  showLoading(true);
+  setLoadingProgress(0, "starting", "Uploading file to server…", "");
+
+  const res = await fetch("/api/jobs", { method: "POST", body: fd });
+  const start = await parseJsonResponse(res);
+  if (!res.ok) {
+    showLoading(false);
+    throw new Error(start.detail || "Upload failed");
+  }
+
+  const hints = start.hints?.length ? start.hints : [];
+  let hintIdx = 0;
+  const nextLocalHint = () => {
+    if (!hints.length) return "Processing…";
+    const h = hints[hintIdx % hints.length];
+    hintIdx += 1;
+    return h;
+  };
+
+  const hintTicker = setInterval(() => {
+    const el = $("loading-hint");
+    if (el && el.textContent === "Processing…") {
+      el.textContent = nextLocalHint();
+    }
+  }, 4000);
+
+  const jobId = start.jobId;
+
+  try {
+    while (true) {
+      await sleep(500);
+      const pollRes = await fetch(`/api/jobs/${jobId}`);
+      const st = await parseJsonResponse(pollRes);
+      if (!pollRes.ok) {
+        throw new Error(st.detail || st.error || "Failed to get job status");
+      }
+
+      const count =
+        st.total > 0
+          ? `Row ${st.current ?? 0} / ${st.total} · ${st.downloaded ?? 0} thumbnails`
+          : "";
+
+      setLoadingProgress(
+        st.percent ?? 0,
+        st.phase || "download",
+        st.hint || nextLocalHint(),
+        count
+      );
+
+      if (st.status === "complete" && st.result) {
+        setLoadingProgress(100, "done", "Starting review…", count);
+        await sleep(300);
+        return st.result;
+      }
+      if (st.status === "error") {
+        throw new Error(st.error || "Processing failed");
+      }
+    }
+  } finally {
+    clearInterval(hintTicker);
+    showLoading(false);
+  }
 }
 
 function resetForNewUpload() {
@@ -326,6 +595,21 @@ $("export-btn").addEventListener("click", exportResults);
 $("export-btn-done").addEventListener("click", exportResults);
 $("upload-another-btn").addEventListener("click", resetForNewUpload);
 
+$("ctx-inspect").addEventListener("click", () => {
+  if (contextItem) openInspectModal(contextItem);
+});
+$("inspect-close").addEventListener("click", closeInspectModal);
+$("inspect-modal").querySelector(".inspect-backdrop").addEventListener("click", closeInspectModal);
+
+$("context-menu").addEventListener("click", (e) => e.stopPropagation());
+document.addEventListener("click", () => hideContextMenu());
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    closeInspectModal();
+    hideContextMenu();
+  }
+});
+
 $("upload-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const fileInput = $("file-input");
@@ -341,15 +625,7 @@ $("upload-form").addEventListener("submit", async (e) => {
   fd.append("k_groups", "0");
 
   try {
-    const res = await fetch("/api/upload", { method: "POST", body: fd });
-    const data = await parseJsonResponse(res);
-    if (!res.ok) {
-      const detail = data.detail;
-      const msg = Array.isArray(detail)
-        ? detail.map((d) => d.msg).join("; ")
-        : detail || "Upload failed";
-      throw new Error(msg);
-    }
+    const data = await uploadWithPolling(fd);
 
     sessionId = data.sessionId;
     brandGroups = data.groups || [];
@@ -366,6 +642,7 @@ $("upload-form").addEventListener("submit", async (e) => {
     setUiForMode();
     showCard();
   } catch (err) {
+    showLoading(false);
     setStatus(err.message || String(err));
   } finally {
     btn.disabled = false;

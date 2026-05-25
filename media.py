@@ -1,5 +1,6 @@
 """Download creative media URLs and produce local image paths for grouping."""
 
+import asyncio
 import hashlib
 import re
 import subprocess
@@ -52,26 +53,44 @@ def detect_advertiser_column(columns: list[str]) -> str | None:
             return lower[cand.lower()]
     for col in columns:
         cl = col.lower()
-        if "advertis" in cl or cl == "brand" or "brand_name" in cl:
+        if "advertis" in cl and cl != "brand":
             return col
     return None
 
 
 def browser_headers_for_url(url: str) -> dict[str, str]:
-    """Headers that improve CDN hotlink fetches (e.g. Unilever assets)."""
+    """Headers that improve CDN hotlink fetches (e.g. Unilever, Adclarity)."""
     parsed = urlparse(url)
-    host = parsed.netloc or ""
-    origin = f"{parsed.scheme or 'https'}://{host}"
+    host = (parsed.netloc or "").lower()
+    origin = f"{parsed.scheme or 'https'}://{parsed.netloc or host}"
+    referer = f"{origin}/"
+    if "adclarity" in host:
+        referer = "https://ads.adclarity.com/"
+    elif "tiktok" in host:
+        referer = "https://www.tiktok.com/"
+    accept = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+    if any(x in url.lower() for x in (".mp4", ".webm", ".mov", "video")):
+        accept = "*/*"
     return {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0.0.0 Safari/537.36"
         ),
-        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "Accept": accept,
         "Accept-Language": "en-US,en;q=0.9",
-        "Referer": f"{origin}/",
+        "Referer": referer,
     }
+
+
+def is_adclarity_url(url: str) -> bool:
+    return "adclarity.com" in url.lower()
+
+
+def is_video_url(url: str) -> bool:
+    lower = url.lower()
+    path = urlparse(url).path.lower()
+    return any(path.endswith(ext) for ext in VIDEO_EXTENSIONS) or "_video.mp4" in lower or ".mp4" in lower
 
 
 def detect_url_column(columns: list[str]) -> str | None:
@@ -137,13 +156,51 @@ def save_bytes(path: Path, data: bytes) -> Path:
     return path
 
 
+def _ffmpeg_header_arg(url: str) -> list[str]:
+    headers = browser_headers_for_url(url)
+    header_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+    return ["-headers", header_str] if header_str else []
+
+
+def extract_video_frame_from_url(url: str, out_path: Path) -> bool:
+    """Grab one frame directly from a remote video URL (skips full MP4 download)."""
+    try:
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            *_ffmpeg_header_arg(url),
+            "-ss",
+            "0.5",
+            "-i",
+            url,
+            "-vframes",
+            "1",
+            "-q:v",
+            "2",
+            str(out_path),
+        ]
+        subprocess.run(cmd, capture_output=True, check=True, timeout=60)
+        return out_path.exists() and out_path.stat().st_size > 0
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        print(f"ffmpeg url frame failed {url[:80]}: {e}")
+        return False
+
+
 def extract_video_frame(video_path: Path, out_path: Path) -> bool:
-    """Extract first frame via ffmpeg if available."""
+    """Extract a poster frame via ffmpeg (fast seek for large Adclarity MP4s)."""
     try:
         subprocess.run(
             [
                 "ffmpeg",
                 "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                "0.5",
                 "-i",
                 str(video_path),
                 "-vframes",
@@ -156,9 +213,110 @@ def extract_video_frame(video_path: Path, out_path: Path) -> bool:
             check=True,
             timeout=60,
         )
-        return out_path.exists()
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return out_path.exists() and out_path.stat().st_size > 0
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        print(f"ffmpeg frame extract failed {video_path}: {e}")
         return False
+
+
+def _fetch_bytes_sync(client: httpx.Client, url: str, timeout: float = 30.0) -> bytes | None:
+    try:
+        resp = client.get(
+            url,
+            follow_redirects=True,
+            timeout=timeout,
+            headers=browser_headers_for_url(url),
+        )
+        resp.raise_for_status()
+        return resp.content
+    except Exception as e:
+        print(f"Fetch failed {url}: {e}")
+        return None
+
+
+def resolve_thumbnail_blocking(url: str, cache_dir: Path) -> Path | None:
+    """Sync thumbnail resolver for use in asyncio.to_thread (won't block event loop)."""
+    if not url:
+        return None
+
+    cache_dir = Path(cache_dir)
+    key = _cache_key(url)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    thumb = youtube_thumbnail_url(url)
+    if thumb:
+        out = cache_dir / f"{key}_yt.jpg"
+        if out.exists():
+            return out
+        with httpx.Client(follow_redirects=True, timeout=30.0) as client:
+            data = _fetch_bytes_sync(client, thumb)
+        if data:
+            return save_bytes(out, data)
+
+    if "tiktok.com" in url.lower() and "adclarity" not in url.lower():
+        from urllib.parse import quote
+
+        oembed = f"https://www.tiktok.com/oembed?url={quote(url, safe='')}"
+        try:
+            with httpx.Client(follow_redirects=True, timeout=25.0) as client:
+                resp = client.get(oembed, headers=browser_headers_for_url("https://www.tiktok.com/"))
+            if resp.status_code == 200:
+                thumb_url = resp.json().get("thumbnail_url")
+                if thumb_url:
+                    out = cache_dir / f"{key}_tt.jpg"
+                    if out.exists():
+                        return out
+                    with httpx.Client(follow_redirects=True, timeout=30.0) as client:
+                        data = _fetch_bytes_sync(client, thumb_url)
+                    if data:
+                        return save_bytes(out, data)
+        except Exception as e:
+            print(f"TikTok oEmbed failed {url}: {e}")
+
+    ext = extension_from_url(url)
+    out = cache_dir / f"{key}{ext}"
+    thumb_jpg = cache_dir / f"{key}_thumb.jpg"
+    video_timeout = 120.0 if is_adclarity_url(url) else 90.0
+
+    if ext in IMAGE_EXTENSIONS and not is_video_url(url):
+        if out.exists():
+            return out
+        with httpx.Client(follow_redirects=True, timeout=video_timeout) as client:
+            data = _fetch_bytes_sync(client, url, timeout=video_timeout)
+        if data:
+            return save_bytes(out, data)
+        return None
+
+    if is_video_url(url) or ext in VIDEO_EXTENSIONS:
+        if thumb_jpg.exists():
+            return thumb_jpg
+        if extract_video_frame_from_url(url, thumb_jpg):
+            return thumb_jpg
+        if not out.exists():
+            with httpx.Client(follow_redirects=True, timeout=video_timeout) as client:
+                data = _fetch_bytes_sync(client, url, timeout=video_timeout)
+            if not data:
+                return None
+            save_bytes(out, data)
+        if extract_video_frame(out, thumb_jpg):
+            return thumb_jpg
+        return None
+
+    if thumb_jpg.exists():
+        return thumb_jpg
+    with httpx.Client(follow_redirects=True, timeout=video_timeout) as client:
+        data = _fetch_bytes_sync(client, url, timeout=video_timeout)
+    if not data:
+        return None
+    guessed = extension_from_url(url)
+    if guessed in VIDEO_EXTENSIONS:
+        vid_path = cache_dir / f"{key}{guessed}"
+        save_bytes(vid_path, data)
+        if extract_video_frame(vid_path, thumb_jpg):
+            return thumb_jpg
+        return None
+    img_path = cache_dir / f"{key}{guessed}"
+    return save_bytes(img_path, data)
 
 
 def extension_from_url(url: str, content_type: str | None = None) -> str:
@@ -199,11 +357,17 @@ async def resolve_thumbnail(
         if data:
             return save_bytes(out, data)
 
-    # TikTok oEmbed thumbnail
-    if "tiktok.com" in url.lower():
-        oembed = f"https://www.tiktok.com/oembed?url={httpx.URL(url)}"
+    # TikTok page URL (not Adclarity-hosted)
+    if "tiktok.com" in url.lower() and "adclarity" not in url.lower():
+        from urllib.parse import quote
+
+        oembed = f"https://www.tiktok.com/oembed?url={quote(url, safe='')}"
         try:
-            resp = await client.get(oembed, timeout=20)
+            resp = await client.get(
+                oembed,
+                timeout=25,
+                headers=browser_headers_for_url("https://www.tiktok.com/"),
+            )
             if resp.status_code == 200:
                 thumb_url = resp.json().get("thumbnail_url")
                 if thumb_url:
@@ -220,8 +384,9 @@ async def resolve_thumbnail(
     ext = extension_from_url(url)
     out = cache_dir / f"{key}{ext}"
     thumb_jpg = cache_dir / f"{key}_thumb.jpg"
+    video_timeout = 180.0 if is_adclarity_url(url) else 120.0
 
-    if ext in IMAGE_EXTENSIONS:
+    if ext in IMAGE_EXTENSIONS and not is_video_url(url):
         if out.exists():
             return out
         data = await fetch_bytes(client, url)
@@ -229,15 +394,17 @@ async def resolve_thumbnail(
             return save_bytes(out, data)
         return None
 
-    if ext in VIDEO_EXTENSIONS or ".mp4" in url.lower():
+    if is_video_url(url) or ext in VIDEO_EXTENSIONS:
         if thumb_jpg.exists():
             return thumb_jpg
+        if await asyncio.to_thread(extract_video_frame_from_url, url, thumb_jpg):
+            return thumb_jpg
         if not out.exists():
-            data = await fetch_bytes(client, url, timeout=120)
+            data = await fetch_bytes(client, url, timeout=video_timeout)
             if not data:
                 return None
             save_bytes(out, data)
-        if extract_video_frame(out, thumb_jpg):
+        if await asyncio.to_thread(extract_video_frame, out, thumb_jpg):
             return thumb_jpg
         return None
 

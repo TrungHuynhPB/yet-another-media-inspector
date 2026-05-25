@@ -242,9 +242,25 @@ header h1 {
 }
 
 .card-subtitle {
-  padding: 0 1rem 0.5rem;
+  padding: 0 0.25rem 0.35rem 1rem;
   font-size: 0.8rem;
   color: var(--muted);
+  line-height: 1.4;
+}
+
+.card-hint {
+  padding: 0 1rem 0.5rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+  line-height: 1.35;
+  opacity: 0.85;
+}
+
+.inspect-subtitle {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin: -0.5rem 0 0.75rem;
+  padding-right: 2.5rem;
   line-height: 1.4;
 }
 
@@ -347,4 +363,217 @@ header h1 {
   color: var(--muted);
   margin-bottom: 1.5rem;
   font-size: 0.9rem;
+}
+
+/* Loading overlay */
+.loading-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(8, 10, 14, 0.92);
+  padding: 1.5rem;
+}
+
+.loading-card {
+  max-width: 360px;
+  width: 100%;
+  text-align: center;
+}
+
+.progress-ring {
+  position: relative;
+  width: 140px;
+  height: 140px;
+  margin: 0 auto 1.25rem;
+}
+
+.progress-ring svg {
+  width: 100%;
+  height: 100%;
+  transform: rotate(-90deg);
+}
+
+.progress-ring-bg {
+  fill: none;
+  stroke: #2a2f3d;
+  stroke-width: 10;
+}
+
+.progress-ring-fill {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 10;
+  stroke-linecap: round;
+  stroke-dasharray: 326.73;
+  stroke-dashoffset: 326.73;
+  transition: stroke-dashoffset 0.25s ease;
+}
+
+.loading-percent {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.35rem;
+  font-weight: 700;
+}
+
+.loading-bar-track {
+  height: 8px;
+  background: #2a2f3d;
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 1rem;
+}
+
+.loading-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--accent), #8fa8ff);
+  border-radius: 4px;
+  transition: width 0.35s ease;
+}
+
+.loading-phase {
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+}
+
+.loading-hint {
+  color: var(--muted);
+  font-size: 0.85rem;
+  line-height: 1.45;
+  min-height: 2.8em;
+  font-style: italic;
+}
+
+.loading-count {
+  margin-top: 0.75rem;
+  font-size: 0.8rem;
+  color: var(--accent);
+}
+
+/* Context menu */
+.context-menu {
+  position: fixed;
+  z-index: 1100;
+  min-width: 160px;
+  background: var(--surface);
+  border: 1px solid #3a4055;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  padding: 0.35rem 0;
+}
+
+.context-menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 0.55rem 1rem;
+  border: none;
+  background: none;
+  color: var(--text);
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.context-menu button:hover {
+  background: rgba(108, 140, 255, 0.15);
+}
+
+/* Inspect modal */
+.inspect-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+}
+
+.inspect-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.75);
+}
+
+.inspect-panel {
+  position: relative;
+  z-index: 1;
+  width: min(720px, 100%);
+  max-height: 92vh;
+  overflow-y: auto;
+  background: var(--surface);
+  border-radius: 16px;
+  padding: 1.25rem 1.25rem 1.5rem;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.55);
+}
+
+.inspect-close {
+  position: absolute;
+  top: 0.75rem;
+  right: 0.75rem;
+  width: 36px;
+  height: 36px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 92, 108, 0.2);
+  color: var(--fault);
+  font-size: 1.1rem;
+  font-weight: 700;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.inspect-close:hover {
+  background: rgba(255, 92, 108, 0.35);
+}
+
+#inspect-title {
+  font-size: 1.1rem;
+  margin-bottom: 1rem;
+  padding-right: 2.5rem;
+}
+
+.inspect-media {
+  margin-bottom: 1rem;
+  background: #000;
+  border-radius: 10px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 200px;
+}
+
+.inspect-media img,
+.inspect-media video {
+  max-width: 100%;
+  max-height: min(55vh, 480px);
+  object-fit: contain;
+}
+
+.inspect-meta {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.inspect-meta dt {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin-bottom: 0.15rem;
+}
+
+.inspect-meta dd {
+  font-size: 0.9rem;
+  line-height: 1.4;
+  word-break: break-word;
+  margin: 0;
 }

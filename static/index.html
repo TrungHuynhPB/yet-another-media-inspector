@@ -26,6 +26,24 @@
         <button type="submit" id="upload-btn">Upload &amp; Group by brand</button>
       </form>
       <p id="upload-status" class="status"></p>
+
+      <div id="loading-overlay" class="loading-overlay hidden" aria-live="polite">
+        <div class="loading-card">
+          <div id="progress-ring" class="progress-ring" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <svg viewBox="0 0 120 120">
+              <circle class="progress-ring-bg" cx="60" cy="60" r="52" />
+              <circle id="progress-ring-fill" class="progress-ring-fill" cx="60" cy="60" r="52" />
+            </svg>
+            <span id="loading-percent" class="loading-percent">0%</span>
+          </div>
+          <div class="loading-bar-track">
+            <div id="loading-bar-fill" class="loading-bar-fill"></div>
+          </div>
+          <p id="loading-phase" class="loading-phase">Starting…</p>
+          <p id="loading-hint" class="loading-hint">Preparing your file…</p>
+          <p id="loading-count" class="loading-count"></p>
+        </div>
+      </div>
     </section>
 
     <section id="review-section" class="hidden">
@@ -39,6 +57,7 @@
         <div id="card" class="card">
           <h2 id="card-title" class="group-title"></h2>
           <p id="card-subtitle" class="card-subtitle hidden"></p>
+          <p id="card-hint" class="card-hint hidden"></p>
           <div id="card-grid" class="thumb-grid" aria-label="Creatives"></div>
           <div id="card-single" class="card-single hidden" aria-label="Creative"></div>
           <div class="card-info">
@@ -65,6 +84,21 @@
       <button type="button" id="export-btn-done" class="export-btn">Download .xlsx</button>
       <button type="button" id="upload-another-btn" class="upload-another-btn">Upload another file</button>
     </section>
+
+    <div id="context-menu" class="context-menu hidden" role="menu">
+      <button type="button" id="ctx-inspect" role="menuitem">Inspect media</button>
+    </div>
+
+    <div id="inspect-modal" class="inspect-modal hidden" role="dialog" aria-modal="true" aria-labelledby="inspect-title">
+      <div class="inspect-backdrop"></div>
+      <div class="inspect-panel">
+        <button type="button" id="inspect-close" class="inspect-close" aria-label="Close">✕</button>
+        <h2 id="inspect-title">Media details</h2>
+        <p id="inspect-subtitle" class="inspect-subtitle hidden"></p>
+        <div id="inspect-media" class="inspect-media"></div>
+        <dl id="inspect-meta" class="inspect-meta"></dl>
+      </div>
+    </div>
   </div>
   <script src="/static/app.js"></script>
 </body>

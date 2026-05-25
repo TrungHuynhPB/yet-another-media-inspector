@@ -1,4 +1,4 @@
-"""Group creatives by brand (advertiser name) and flag uncertain ads for individual review."""
+"""Group creatives by brand column; advertiser_name shown as subtitle in UI."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ from collections import Counter, defaultdict
 import imagehash
 from PIL import Image
 
-# Perceptual-hash distance above this (0–64) suggests a different visual identity.
 OUTLIER_MIN_DISTANCE = 18
 
 
@@ -16,10 +15,10 @@ def normalize_brand_key(name: str) -> str:
     return name.strip().lower() if name else ""
 
 
-def brand_display_name(names: list[str]) -> str:
+def display_name(names: list[str], fallback: str = "Unknown") -> str:
     cleaned = [n.strip() for n in names if n and n.strip()]
     if not cleaned:
-        return "Unknown brand"
+        return fallback
     return Counter(cleaned).most_common(1)[0][0]
 
 
@@ -32,10 +31,6 @@ def _phash(path: str) -> imagehash.ImageHash | None:
 
 
 def find_visual_outliers(members: list[dict]) -> list[dict]:
-    """
-    Within a brand, flag creatives that look unlike the rest (possible mis-label).
-    Requires at least 4 thumbnails in the brand.
-    """
     with_thumb = [m for m in members if m.get("thumb")]
     if len(with_thumb) < 4:
         return []
@@ -74,20 +69,15 @@ def build_brand_groups(
     rows: list[dict],
     to_items,
 ) -> tuple[list[dict], list[dict]]:
-    """
-    Returns (brand_groups, uncertain_items).
-    Brand groups are keyed by advertiser name from the spreadsheet.
-    Uncertain items need one-by-one advertiser verification.
-    """
     by_brand: dict[str, list[dict]] = defaultdict(list)
     uncertain_rows: list[dict] = []
 
     for row in rows:
         if not row.get("url"):
             continue
-        key = normalize_brand_key(row.get("advertiserName") or "")
+        key = normalize_brand_key(row.get("brandName") or "")
         if not key:
-            row["uncertainReason"] = "missing_advertiser"
+            row["uncertainReason"] = "missing_brand"
             uncertain_rows.append(row)
         else:
             by_brand[key].append(row)
@@ -95,7 +85,10 @@ def build_brand_groups(
     brand_groups: list[dict] = []
     gid = 0
 
-    for _key in sorted(by_brand.keys(), key=lambda k: brand_display_name([m["advertiserName"] for m in by_brand[k]])):
+    for _key in sorted(
+        by_brand.keys(),
+        key=lambda k: display_name([m["brandName"] for m in by_brand[k]], "Unknown brand"),
+    ):
         members = by_brand[_key]
         outliers = find_visual_outliers(members)
         outlier_ids = {int(m["index"]) for m in outliers}
@@ -109,7 +102,12 @@ def build_brand_groups(
         if not brand_members:
             continue
 
-        title = brand_display_name([m["advertiserName"] for m in brand_members])
+        title = display_name([m["brandName"] for m in brand_members], "Unknown brand")
+        subtitle = display_name(
+            [m.get("advertiserName") or "" for m in brand_members],
+            "",
+        )
+
         for m in brand_members:
             m["groupId"] = gid
 
@@ -119,6 +117,7 @@ def build_brand_groups(
                 "groupId": gid,
                 "type": "brand",
                 "title": title,
+                "subtitle": subtitle,
                 "memberIndices": [int(m["index"]) for m in brand_members],
                 "items": items,
                 "thumbs": [i["thumbUrl"] for i in items if i.get("thumbUrl")],
@@ -137,7 +136,8 @@ def build_brand_groups(
                 "itemId": item_id,
                 "rowIndex": int(row["index"]),
                 "type": "individual",
-                "title": row.get("advertiserName") or "Unknown advertiser",
+                "title": row.get("brandName") or "Unknown brand",
+                "subtitle": row.get("advertiserName") or "",
                 "uncertainReason": row.get("uncertainReason", "review"),
                 "items": items,
                 "count": 1,
