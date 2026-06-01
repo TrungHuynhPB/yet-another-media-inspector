@@ -3,9 +3,10 @@
 import asyncio
 import json
 import logging
+import sys
 import uuid
 from collections.abc import AsyncIterator
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 
 import httpx
@@ -15,7 +16,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Streamin
 from fastapi.staticfiles import StaticFiles
 
 from brand_grouping import build_brand_groups
-from hints_loader import load_hints
+from hints_loader import hint_rotate_ms, load_hints
 from metadata import column_lookup, row_metadata
 from metadata import (
     brand_column_error,
@@ -23,7 +24,14 @@ from metadata import (
     detect_brand_column,
     prepare_upload_dataframe,
 )
-from media import detect_url_column, resolve_thumbnail_blocking
+from media import (
+    detect_url_column,
+    opencv_available,
+    opencv_diagnostics,
+    opencv_unavailable_reason,
+    resolve_thumbnails_batch,
+    thumbnail_concurrency,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +41,30 @@ STATIC_DIR = BASE_DIR / "static"
 
 app = FastAPI(title="Media Inspector")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+def _opencv_warning() -> str:
+    if opencv_available():
+        return ""
+    return opencv_unavailable_reason() or (
+        f"opencv-python is not installed for {sys.executable} — "
+        "video creatives may show as unavailable."
+    )
+
+
+@app.on_event("startup")
+async def _check_opencv_on_startup() -> None:
+    diag = opencv_diagnostics()
+    logger.info("Python: %s", diag["pythonExecutable"])
+    if diag.get("opencvAvailable"):
+        logger.info("OpenCV %s ready", diag.get("opencvVersion", ""))
+    else:
+        logger.warning(_opencv_warning())
+
+
+def _opencv_warnings() -> list[str]:
+    msg = _opencv_warning()
+    return [] if not msg else [msg]
+
 
 _sessions: dict[str, dict] = {}
 _jobs: dict[str, dict] = {}
@@ -70,6 +102,18 @@ def _member_items(session_id: str, members: list[dict]) -> list[dict]:
     return items
 
 
+def _read_csv_bytes(raw: bytes) -> pd.DataFrame:
+    """Parse CSV with common encodings and auto-detected delimiter (; or ,)."""
+    last_err: Exception | None = None
+    for encoding in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
+        try:
+            text = raw.decode(encoding)
+            return pd.read_csv(StringIO(text), sep=None, engine="python")
+        except Exception as exc:
+            last_err = exc
+    raise HTTPException(400, f"Could not read CSV: {last_err}")
+
+
 def _load_dataframe(raw: bytes, filename: str) -> pd.DataFrame:
     name = (filename or "").lower()
     if name.endswith(".json"):
@@ -82,7 +126,9 @@ def _load_dataframe(raw: bytes, filename: str) -> pd.DataFrame:
     if name.endswith((".xlsx", ".xls")):
         return prepare_upload_dataframe(pd.read_excel(BytesIO(raw)))
     if name.endswith(".csv"):
-        return prepare_upload_dataframe(pd.read_csv(BytesIO(raw)))
+        return prepare_upload_dataframe(_read_csv_bytes(raw))
+    if name.endswith(".txt"):
+        return prepare_upload_dataframe(_read_csv_bytes(raw))
     raise HTTPException(400, "Upload .xlsx, .xls, .csv, or .json")
 
 
@@ -117,8 +163,9 @@ def _make_row(
     adv_col: str | None,
     meta_lookup: dict,
     thumb: Path | None,
+    thumb_fetch_detail: str | None = None,
 ) -> dict:
-    return {
+    row = {
         "index": int(idx),
         "url": url,
         "brandName": _cell_str(df.iloc[idx][brand_col]),
@@ -131,6 +178,13 @@ def _make_row(
         "needsIndividualReview": False,
         "faultManual": False,
     }
+    if thumb_fetch_detail:
+        row["thumbFetchDetail"] = thumb_fetch_detail
+    return row
+
+
+def _urls_from_column(df: pd.DataFrame, col: str) -> list[str]:
+    return [_cell_str(raw) for raw in df[col].astype(str)]
 
 
 async def _download_rows(
@@ -142,23 +196,40 @@ async def _download_rows(
     meta_lookup: dict,
     on_progress=None,
 ) -> list[dict]:
-    url_series = df[col].astype(str)
-    total = len(url_series)
-    rows: list[dict] = []
+    urls = _urls_from_column(df, col)
+    total = len(urls)
+    unique_total = len({u for u in urls if u})
+    row_count = 0
     downloaded = 0
 
-    for idx, raw_url in enumerate(url_series):
-        url = _cell_str(raw_url)
-        thumb = None
-        if url:
-            thumb = await asyncio.to_thread(
-                resolve_thumbnail_blocking, url, cache_dir
+    def batch_progress(done: int, _unique: int, dl: int) -> None:
+        nonlocal row_count, downloaded
+        row_count = done
+        downloaded = dl
+
+    thumb_by_url, fetch_failures = await asyncio.to_thread(
+        resolve_thumbnails_batch,
+        urls,
+        cache_dir,
+        thumbnail_concurrency(),
+        batch_progress,
+    )
+
+    rows: list[dict] = []
+    row_downloaded = 0
+    for idx, url in enumerate(urls):
+        thumb = thumb_by_url.get(url) if url else None
+        if thumb:
+            row_downloaded += 1
+        detail = fetch_failures.get(url) if url and not thumb else None
+        rows.append(
+            _make_row(
+                df, idx, url, brand_col, adv_col, meta_lookup, thumb, detail
             )
-            if thumb:
-                downloaded += 1
-        rows.append(_make_row(df, idx, url, brand_col, adv_col, meta_lookup, thumb))
+        )
         if on_progress:
-            await on_progress(idx + 1, total, downloaded)
+            approx = int((idx + 1) / max(total, 1) * unique_total)
+            await on_progress(approx, total, row_downloaded)
 
     return rows
 
@@ -178,8 +249,10 @@ def _finalize_session(
     def to_items(members: list[dict]) -> list[dict]:
         return _member_items(session_id, members)
 
-    group_list, uncertain_list = build_brand_groups(with_url, to_items)
-    if not group_list and not uncertain_list:
+    group_list, uncertain_list, unavailable_media = build_brand_groups(
+        with_url, to_items
+    )
+    if not group_list and not uncertain_list and not unavailable_media:
         raise HTTPException(400, "No groupable rows found.")
 
     _sessions[session_id] = {
@@ -190,8 +263,10 @@ def _finalize_session(
         "rows": rows,
         "groups": group_list,
         "uncertain": uncertain_list,
+        "unavailable": unavailable_media,
         "group_cursor": 0,
         "uncertain_cursor": 0,
+        "unavailable_reviewed": False,
     }
 
     return {
@@ -200,9 +275,12 @@ def _finalize_session(
         "downloaded": sum(1 for r in rows if r.get("thumb")),
         "groupCount": len(group_list),
         "uncertainCount": len(uncertain_list),
+        "unavailableCount": unavailable_media["count"] if unavailable_media else 0,
         "groups": group_list,
         "uncertain": uncertain_list,
+        "unavailable": unavailable_media,
         "groupingMethod": "brand",
+        "warnings": _opencv_warnings(),
     }
 
 
@@ -213,7 +291,13 @@ async def index():
 
 @app.get("/api/hints")
 async def get_hints():
-    return {"hints": load_hints()}
+    return {"hints": load_hints(), "hintRotateMs": hint_rotate_ms()}
+
+
+@app.get("/api/diagnostics")
+async def get_diagnostics():
+    """Environment check (OpenCV / Python path) — useful when video thumbs all fail."""
+    return opencv_diagnostics()
 
 
 def _job_update(job_id: str, **fields) -> None:
@@ -253,38 +337,49 @@ async def _process_job(
             downloaded=0,
         )
 
-        rows = []
-        url_series = df[col].astype(str)
-        downloaded = 0
+        urls = _urls_from_column(df, col)
+        unique_total = len({u for u in urls if u})
+        workers = thumbnail_concurrency()
 
-        for idx, raw_url in enumerate(url_series):
-            url = _cell_str(raw_url)
-            pct = 5 + int((idx / max(total, 1)) * 85)
+        _job_update(
+            job_id,
+            phase="download",
+            percent=5,
+            hint=(
+                f"Downloading {unique_total} unique URLs "
+                f"({total} rows, {workers} parallel workers)…"
+            ),
+            current=0,
+            total=total,
+            downloaded=0,
+        )
 
+        def batch_progress(done: int, _unique: int, dl: int) -> None:
+            pct = 5 + int((done / max(unique_total, 1)) * 85)
             _job_update(
                 job_id,
-                current=idx,
+                current=done,
                 percent=min(pct, 90),
-                hint=f"Fetching row {idx + 1} of {total}…",
-                downloaded=downloaded,
+                hint=f"Fetched {done} of {unique_total} unique URLs… {next_hint()}",
+                downloaded=dl,
             )
 
-            thumb = None
-            if url:
-                thumb = await asyncio.to_thread(
-                    resolve_thumbnail_blocking, url, cache_dir
+        thumb_by_url, fetch_failures = await asyncio.to_thread(
+            resolve_thumbnails_batch,
+            urls,
+            cache_dir,
+            workers,
+            batch_progress,
+        )
+
+        rows = []
+        for idx, url in enumerate(urls):
+            thumb = thumb_by_url.get(url) if url else None
+            detail = fetch_failures.get(url) if url and not thumb else None
+            rows.append(
+                _make_row(
+                    df, idx, url, brand_col, adv_col, meta_lookup, thumb, detail
                 )
-                if thumb:
-                    downloaded += 1
-
-            rows.append(_make_row(df, idx, url, brand_col, adv_col, meta_lookup, thumb))
-
-            _job_update(
-                job_id,
-                current=idx + 1,
-                percent=min(5 + int(((idx + 1) / max(total, 1)) * 85), 90),
-                hint=next_hint(),
-                downloaded=downloaded,
             )
 
         _job_update(
@@ -349,6 +444,8 @@ async def create_job(
         "jobId": job_id,
         "total": len(df),
         "hints": load_hints(),
+        "hintRotateMs": hint_rotate_ms(),
+        "warnings": _opencv_warnings(),
     }
 
 
@@ -437,72 +534,96 @@ async def upload_stream(
             cache_dir = _session_dir(session_id) / "cache"
             cache_dir.mkdir(parents=True, exist_ok=True)
 
+            urls = _urls_from_column(df, col)
+            unique_total = len({u for u in urls if u})
+            workers = thumbnail_concurrency()
+            progress = {"done": 0, "downloaded": 0}
+
+            def batch_progress(done: int, _unique: int, dl: int) -> None:
+                progress["done"] = done
+                progress["downloaded"] = dl
+
+            yield _stream_line(
+                {
+                    "type": "progress",
+                    "phase": "download",
+                    "current": 0,
+                    "total": total,
+                    "downloaded": 0,
+                    "hint": (
+                        f"Downloading {unique_total} unique URLs "
+                        f"({total} rows, {workers} workers)…"
+                    ),
+                    "percent": 5,
+                    "status": "fetching",
+                }
+            )
+            await asyncio.sleep(0)
+
+            batch_task = asyncio.create_task(
+                asyncio.to_thread(
+                    resolve_thumbnails_batch,
+                    urls,
+                    cache_dir,
+                    workers,
+                    batch_progress,
+                )
+            )
+            while not batch_task.done():
+                done = progress["done"]
+                dl = progress["downloaded"]
+                pct = 5 + int((done / max(unique_total, 1)) * 85)
+                yield _stream_line(
+                    {
+                        "type": "progress",
+                        "phase": "download",
+                        "current": done,
+                        "total": total,
+                        "downloaded": dl,
+                        "hint": (
+                            f"Fetched {done} of {unique_total} unique URLs… "
+                            f"{next_hint()}"
+                        ),
+                        "percent": min(pct, 90),
+                        "status": "working",
+                    }
+                )
+                await asyncio.sleep(2.0)
+
+            thumb_by_url, fetch_failures = batch_task.result()
             rows = []
-            url_series = df[col].astype(str)
             downloaded = 0
-            for idx, raw_url in enumerate(url_series):
-                url = _cell_str(raw_url)
-                base_pct = 5 + int((idx / max(total, 1)) * 85)
-
-                yield _stream_line(
-                    {
-                        "type": "progress",
-                        "phase": "download",
-                        "current": idx,
-                        "total": total,
-                        "downloaded": downloaded,
-                        "hint": f"Fetching row {idx + 1} of {total}…",
-                        "percent": min(base_pct, 90),
-                        "status": "fetching",
-                    }
-                )
-                await asyncio.sleep(0)
-
-                thumb = None
-                if url:
-                    task = asyncio.create_task(
-                        asyncio.to_thread(resolve_thumbnail_blocking, url, cache_dir)
-                    )
-                    while not task.done():
-                        _, pending = await asyncio.wait({task}, timeout=2.0)
-                        if pending:
-                            yield _stream_line(
-                                {
-                                    "type": "progress",
-                                    "phase": "download",
-                                    "current": idx,
-                                    "total": total,
-                                    "downloaded": downloaded,
-                                    "hint": (
-                                        f"Still on row {idx + 1}/{total} "
-                                        f"(videos may take ~30s)… {next_hint()}"
-                                    ),
-                                    "percent": min(base_pct, 90),
-                                    "status": "working",
-                                }
-                            )
-                            await asyncio.sleep(0)
-                    thumb = task.result()
-                    if thumb:
-                        downloaded += 1
-
+            for idx, url in enumerate(urls):
+                thumb = thumb_by_url.get(url) if url else None
+                if thumb:
+                    downloaded += 1
+                detail = fetch_failures.get(url) if url and not thumb else None
                 rows.append(
-                    _make_row(df, idx, url, brand_col, adv_col, meta_lookup, thumb)
+                    _make_row(
+                        df,
+                        idx,
+                        url,
+                        brand_col,
+                        adv_col,
+                        meta_lookup,
+                        thumb,
+                        detail,
+                    )
                 )
-                done_pct = 5 + int(((idx + 1) / max(total, 1)) * 85)
-                yield _stream_line(
-                    {
-                        "type": "progress",
-                        "phase": "download",
-                        "current": idx + 1,
-                        "total": total,
-                        "downloaded": downloaded,
-                        "hint": next_hint(),
-                        "percent": min(done_pct, 90),
-                        "status": "done",
-                    }
-                )
-                await asyncio.sleep(0)
+
+            yield _stream_line(
+                {
+                    "type": "progress",
+                    "phase": "download",
+                    "current": total,
+                    "total": total,
+                    "downloaded": downloaded,
+                    "hint": next_hint(),
+                    "percent": 90,
+                    "status": "done",
+                }
+            )
+            await asyncio.sleep(0)
 
             yield _stream_line(
                 {
@@ -641,9 +762,69 @@ async def toggle_fault(session_id: str, body: dict):
     return {"ok": True, "rowIndex": int(row_index), "isFault": is_fault}
 
 
+@app.post("/api/session/{session_id}/review-unavailable")
+async def review_unavailable(session_id: str, body: dict):
+    """Mark all unavailable-media rows reviewed after the single table swipe."""
+    sess = _sessions.get(session_id)
+    if not sess:
+        raise HTTPException(404, "Session not found")
+
+    unavailable = sess.get("unavailable")
+    if not unavailable:
+        raise HTTPException(404, "No unavailable media session")
+
+    is_fault = bool(body.get("isFault", False))
+    indices = {int(e["rowIndex"]) for e in unavailable.get("entries", [])}
+
+    for row in sess["rows"]:
+        if row["index"] in indices:
+            row["reviewed"] = True
+            row["advertiserMatch"] = not is_fault
+            if is_fault:
+                row["isFault"] = True
+
+    sess["unavailable_reviewed"] = True
+    return {"ok": True, "count": len(indices)}
+
+
+@app.post("/api/session/{session_id}/review-uncertain")
+async def review_uncertain_group(session_id: str, body: dict):
+    """Confirm or reject brand labels for all creatives in an uncertain brand group."""
+    sess = _sessions.get(session_id)
+    if not sess:
+        raise HTTPException(404, "Session not found")
+
+    group_id = body.get("groupId")
+    advertiser_match = bool(body.get("advertiserMatch", False))
+    if group_id is None:
+        raise HTTPException(400, "groupId required")
+
+    group = next(
+        (g for g in sess.get("uncertain", []) if g["groupId"] == group_id),
+        None,
+    )
+    if not group:
+        raise HTTPException(404, "Uncertain group not found")
+
+    indices = {int(i) for i in group.get("memberIndices", [])}
+    for row in sess["rows"]:
+        if row["index"] in indices:
+            row["advertiserMatch"] = advertiser_match
+            row["reviewed"] = True
+            if not advertiser_match:
+                row["isFault"] = True
+            elif not row.get("faultManual"):
+                row["isFault"] = False
+
+    sess["uncertain_cursor"] = min(
+        sess["uncertain_cursor"] + 1, len(sess.get("uncertain", []))
+    )
+    return {"ok": True, "cursor": sess["uncertain_cursor"]}
+
+
 @app.post("/api/session/{session_id}/review-item")
 async def review_item(session_id: str, body: dict):
-    """Confirm whether the creative matches its advertiser label."""
+    """Confirm whether the creative matches its advertiser label (single row)."""
     sess = _sessions.get(session_id)
     if not sess:
         raise HTTPException(404, "Session not found")

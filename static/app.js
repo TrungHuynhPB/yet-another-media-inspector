@@ -1,7 +1,8 @@
 let sessionId = null;
 let brandGroups = [];
 let uncertainItems = [];
-let mode = "individual";
+let unavailableMedia = null;
+let mode = "unavailable"; // unavailable | uncertain | brand
 let cursor = 0;
 let reviewing = false;
 let contextItem = null;
@@ -33,6 +34,7 @@ const cardSubtitle = $("card-subtitle");
 const cardHint = $("card-hint");
 const cardGrid = $("card-grid");
 const cardSingle = $("card-single");
+const cardUnavailable = $("card-unavailable");
 const cardCount = $("card-count");
 const progressFill = $("progress-fill");
 const progressText = $("progress-text");
@@ -47,12 +49,61 @@ function setStatus(msg) {
 }
 
 function currentQueue() {
-  return mode === "individual" ? uncertainItems : brandGroups;
+  if (mode === "unavailable") return unavailableMedia ? [unavailableMedia] : [];
+  if (mode === "uncertain") return uncertainItems;
+  return brandGroups;
+}
+
+function unavailableStepCount() {
+  return unavailableMedia ? 1 : 0;
+}
+
+function totalReviewSteps() {
+  return unavailableStepCount() + uncertainItems.length + brandGroups.length;
+}
+
+function renderUnavailableTable(session) {
+  const tbody = $("unavailable-tbody");
+  if (!tbody) return;
+  tbody.innerHTML = "";
+  const entries = session.entries || [];
+  entries.forEach((row) => {
+    const tr = document.createElement("tr");
+    const brandTd = document.createElement("td");
+    const brand = (row.brand || "").trim();
+    const advertiser = (row.advertiserName || "").trim();
+    if (brand && advertiser && brand !== advertiser) {
+      brandTd.textContent = `${brand} / ${advertiser}`;
+    } else {
+      brandTd.textContent = brand || advertiser || "—";
+    }
+    const urlTd = document.createElement("td");
+    const link = document.createElement("a");
+    link.href = row.creativeUrl;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = row.creativeUrl;
+    urlTd.appendChild(link);
+    const reasonTd = document.createElement("td");
+    const parts = [row.reason || "Unavailable image"];
+    if (row.fetchDetail && !parts[0].includes(row.fetchDetail)) {
+      parts.push(row.fetchDetail);
+    }
+    reasonTd.textContent = parts.filter(Boolean).join(" — ");
+    tr.appendChild(brandTd);
+    tr.appendChild(urlTd);
+    tr.appendChild(reasonTd);
+    tbody.appendChild(tr);
+  });
 }
 
 function renderSingleImage(container, items) {
   container.innerHTML = "";
   items.forEach((item, i) => {
+    const cell = document.createElement("div");
+    cell.className = "single-media-cell";
+    cell.setAttribute("aria-label", "Creative — right-click to inspect");
+
     const img = document.createElement("img");
     img.alt = `Creative ${i + 1}`;
     img.loading = "lazy";
@@ -64,7 +115,112 @@ function renderSingleImage(container, items) {
     if (thumbUrl && mediaUrl && thumbUrl !== mediaUrl) {
       img.addEventListener("error", () => { img.src = mediaUrl; }, { once: true });
     }
-    container.appendChild(img);
+
+    cell.appendChild(img);
+    cell._item = item;
+    cell.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openContextMenu(e.clientX, e.clientY, item);
+    });
+    container.appendChild(cell);
+  });
+}
+
+function enrichInspectItem(item) {
+  const group = currentQueue()[cursor];
+  return {
+    ...item,
+    title: item.title || group?.title || item.metadata?.brand || "",
+    subtitle:
+      item.subtitle ||
+      group?.subtitle ||
+      item.metadata?.advertiser_name ||
+      "",
+  };
+}
+
+/** Accept new uncertain groups and legacy per-row payloads from older sessions. */
+function normalizeUncertainItems(raw) {
+  if (!Array.isArray(raw) || !raw.length) return [];
+  const out = [];
+  let nextGroupId = 0;
+
+  for (const entry of raw) {
+    if (
+      entry.type === "uncertain" &&
+      Array.isArray(entry.items) &&
+      entry.items.length &&
+      entry.groupId != null
+    ) {
+      out.push(entry);
+      nextGroupId = Math.max(nextGroupId, Number(entry.groupId) + 1);
+      continue;
+    }
+
+    const items = Array.isArray(entry.items) && entry.items.length
+      ? entry.items
+      : entry.rowIndex != null
+        ? [
+            {
+              rowIndex: entry.rowIndex,
+              mediaUrl: entry.mediaUrl,
+              thumbUrl: entry.thumbUrl,
+              isFault: Boolean(entry.isFault),
+              metadata: entry.metadata || {},
+            },
+          ]
+        : [];
+
+    if (!items.length) continue;
+
+    out.push({
+      groupId: entry.groupId != null ? entry.groupId : nextGroupId++,
+      type: "uncertain",
+      title: entry.title || "Unknown brand",
+      subtitle: entry.subtitle || "",
+      uncertainReason: entry.uncertainReason || "review",
+      reasonHint: entry.reasonHint || "Verify brand labels for this group.",
+      memberIndices: items.map((i) => Number(i.rowIndex)),
+      items,
+      count: items.length,
+    });
+  }
+  return out;
+}
+
+function isGridReviewMode() {
+  return mode === "uncertain" || mode === "brand";
+}
+
+function bindGridInteractions() {
+  if (!cardGrid || cardGrid.dataset.bound === "1") return;
+  cardGrid.dataset.bound = "1";
+
+  cardGrid.addEventListener(
+    "pointerdown",
+    (e) => {
+      if (e.target.closest(".thumb-cell")) e.stopPropagation();
+    },
+    true
+  );
+
+  cardGrid.addEventListener("click", (e) => {
+    if (!isGridReviewMode()) return;
+    const cell = e.target.closest(".thumb-cell");
+    if (!cell?._item) return;
+    e.preventDefault();
+    e.stopPropagation();
+    toggleImageFault(cell._item, cell);
+  });
+
+  cardGrid.addEventListener("contextmenu", (e) => {
+    if (!isGridReviewMode()) return;
+    const cell = e.target.closest(".thumb-cell");
+    if (!cell?._item) return;
+    e.preventDefault();
+    e.stopPropagation();
+    openInspectModal(enrichInspectItem(cell._item));
   });
 }
 
@@ -73,10 +229,8 @@ function renderBrandGrid(container, items) {
   items.forEach((item) => {
     const cell = document.createElement("button");
     cell.type = "button";
-    cell.className = "thumb-cell" + (item.isFault ? " is-fault" : "");
+    cell.className = "thumb-cell";
     cell.dataset.rowIndex = String(item.rowIndex);
-    cell.setAttribute("aria-pressed", item.isFault ? "true" : "false");
-    cell.setAttribute("aria-label", item.isFault ? "Marked fault — click to clear" : "Mark as fault");
 
     const img = document.createElement("img");
     img.alt = "Creative";
@@ -97,26 +251,30 @@ function renderBrandGrid(container, items) {
     cell.appendChild(img);
     cell.appendChild(overlay);
     cell._item = item;
-    cell.addEventListener("click", (e) => {
-      e.stopPropagation();
-      toggleImageFault(item, cell);
-    });
-    cell.addEventListener("contextmenu", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      openContextMenu(e.clientX, e.clientY, item);
-    });
+    applyFaultUi(item, cell, Boolean(item.isFault));
     container.appendChild(cell);
   });
 }
 
-function updateBrandCountText() {
-  const g = brandGroups[cursor];
+function updateGroupCountText() {
+  const queue = currentQueue();
+  const g = queue[cursor];
   if (!g?.items) return;
   const faultCount = g.items.filter((i) => i.isFault).length;
   const active = g.items.length - faultCount;
+  const label = mode === "uncertain" ? "Uncertain brand" : "Brand";
   cardCount.textContent =
-    `Brand ${cursor + 1} of ${brandGroups.length} · ${active} active · ${faultCount} marked fault · tap image to toggle`;
+    `${label} ${cursor + 1} of ${queue.length} · ${active} active · ${faultCount} marked fault · tap image to toggle`;
+}
+
+function applyFaultUi(item, cell, isFault) {
+  item.isFault = isFault;
+  cell.classList.toggle("is-fault", isFault);
+  cell.setAttribute("aria-pressed", isFault ? "true" : "false");
+  cell.setAttribute(
+    "aria-label",
+    isFault ? "Marked fault — click to clear ✕" : "Mark as fault (✕)"
+  );
 }
 
 async function toggleImageFault(item, cell) {
@@ -130,36 +288,41 @@ async function toggleImageFault(item, cell) {
     const data = await parseJsonResponse(res);
     if (!res.ok) throw new Error(data.detail || "Update failed");
 
-    item.isFault = data.isFault;
-    cell.classList.toggle("is-fault", item.isFault);
-    cell.setAttribute("aria-pressed", item.isFault ? "true" : "false");
-    cell.setAttribute(
-      "aria-label",
-      item.isFault ? "Marked fault — click to clear" : "Mark as fault"
-    );
-    updateBrandCountText();
+    applyFaultUi(item, cell, data.isFault);
+    updateGroupCountText();
   } catch (err) {
     setStatus(err.message || String(err));
   }
 }
 
 function setUiForMode() {
-  const isIndividual = mode === "individual";
-  cardGrid.classList.toggle("hidden", isIndividual);
-  cardSingle.classList.toggle("hidden", !isIndividual);
+  const isUnavailable = mode === "unavailable";
+  const isUncertain = mode === "uncertain";
+  cardGrid.classList.toggle("hidden", isUnavailable);
+  cardSingle.classList.add("hidden");
+  if (cardUnavailable) {
+    cardUnavailable.classList.toggle("hidden", !isUnavailable);
+  }
 
-  if (isIndividual) {
-    hintLeft.textContent = "← Wrong brand";
-    hintRight.textContent = "Correct brand →";
+  if (isUnavailable) {
+    hintLeft.textContent = "← Mark all fault";
+    hintRight.textContent = "Acknowledge →";
+    btnFault.textContent = "✕ Mark all fault";
+    btnOk.textContent = "✓ Continue";
+    modeLabel.textContent = "Unavailable media — review table, then swipe";
+  } else if (isUncertain) {
+    hintLeft.textContent = "← Wrong brand (group)";
+    hintRight.textContent = "Correct brand (group) →";
     btnFault.textContent = "✕ Wrong brand";
     btnOk.textContent = "✓ Correct brand";
-    modeLabel.textContent = "Step 1 · Verify uncertain ads (one at a time)";
+    modeLabel.textContent =
+      "Uncertain ads · grouped by brand (grid: tap ✕ fault, right-click inspect)";
   } else {
     hintLeft.textContent = "← Fault (whole group)";
     hintRight.textContent = "OK (whole group) →";
     btnFault.textContent = "✕ Fault group";
     btnOk.textContent = "✓ OK group";
-    modeLabel.textContent = "Step 2 · Review brand groups";
+    modeLabel.textContent = "Review brand groups";
   }
 }
 
@@ -193,56 +356,79 @@ function setCardHeader({ title, subtitle, hint }) {
 
 function showCard() {
   reviewing = false;
+  setUiForMode();
   const queue = currentQueue();
 
-  if (mode === "individual" && cursor >= uncertainItems.length) {
-    if (brandGroups.length > 0) {
-      mode = "brand";
+  if (mode === "unavailable") {
+    if (!unavailableMedia || cursor >= queue.length) {
+      mode = uncertainItems.length > 0 ? "uncertain" : "brand";
       cursor = 0;
       setUiForMode();
       showCard();
       return;
     }
-    finishReview();
-    return;
-  }
-
-  if (mode === "brand" && cursor >= brandGroups.length) {
-    finishReview();
-    return;
-  }
-
-  const item = queue[cursor];
-  const items = item.items?.length ? item.items : [];
-
-  if (mode === "individual") {
-    const reason =
-      item.uncertainReason === "visual_outlier"
-        ? "This creative looks different from others in the same brand group."
-        : item.uncertainReason === "missing_brand"
-          ? "No brand on this row."
-          : "Confirm the brand label matches this creative.";
+    const session = queue[cursor];
     setCardHeader({
-      title: item.title || "Unknown brand",
-      subtitle: item.subtitle,
-      hint: reason,
+      title: session.title || "Unavailable media",
+      subtitle: `${session.count} creatives could not be previewed`,
+      hint: "Open creative URLs in the table (new tab). Swipe right when done, or left to mark all as fault.",
     });
-    cardCount.textContent = `Uncertain ${cursor + 1} of ${uncertainItems.length}`;
-    renderSingleImage(cardSingle, items);
+    cardCount.textContent = `${session.count} unavailable · 1 review step`;
+    renderUnavailableTable(session);
   } else {
-    setCardHeader({
-      title: item.title,
-      subtitle: item.subtitle,
-      hint: "Left-click: mark fault · Right-click: inspect media",
-    });
+    if (mode === "uncertain" && cursor >= uncertainItems.length) {
+      if (brandGroups.length > 0) {
+        mode = "brand";
+        cursor = 0;
+        setUiForMode();
+        showCard();
+        return;
+      }
+      finishReview();
+      return;
+    }
+
+    if (mode === "brand" && cursor >= brandGroups.length) {
+      finishReview();
+      return;
+    }
+
+    const item = queue[cursor];
+    const items = item.items?.length ? item.items : [];
+
+    const gridHint =
+      "Tap image to toggle ✕ fault · Right-click to inspect · Swipe for whole group";
+    if (mode === "uncertain") {
+      const reasonHint =
+        item.reasonHint ||
+        "Verify the brand label matches every creative in this group.";
+      setCardHeader({
+        title: item.title || "Unknown brand",
+        subtitle: item.subtitle,
+        hint: `${reasonHint} ${gridHint}`,
+      });
+    } else {
+      setCardHeader({
+        title: item.title,
+        subtitle: item.subtitle,
+        hint: gridHint,
+      });
+    }
+    if (cardGrid) cardGrid.classList.remove("hidden");
+    if (cardSingle) cardSingle.classList.add("hidden");
     renderBrandGrid(cardGrid, items);
-    updateBrandCountText();
+    updateGroupCountText();
   }
 
-  const totalSteps = uncertainItems.length + brandGroups.length;
-  const doneSteps =
-    (mode === "brand" ? uncertainItems.length : 0) +
-    (mode === "individual" ? cursor : cursor + uncertainItems.length);
+  const totalSteps = totalReviewSteps();
+  let doneSteps = unavailableStepCount();
+  if (mode === "unavailable") {
+    doneSteps = 0;
+  } else if (mode === "uncertain") {
+    doneSteps = unavailableStepCount() + cursor;
+  } else {
+    doneSteps = unavailableStepCount() + uncertainItems.length + cursor;
+  }
   progressFill.style.width = totalSteps ? `${(doneSteps / totalSteps) * 100}%` : "0%";
   progressText.textContent = `${doneSteps} / ${totalSteps} items reviewed`;
 
@@ -416,20 +602,18 @@ async function uploadWithPolling(fd) {
   }
 
   const hints = start.hints?.length ? start.hints : [];
+  const hintRotateMs = start.hintRotateMs || 5500;
   let hintIdx = 0;
-  const nextLocalHint = () => {
-    if (!hints.length) return "Processing…";
-    const h = hints[hintIdx % hints.length];
-    hintIdx += 1;
-    return h;
-  };
+  const hintEl = $("loading-hint");
+  if (hints.length && hintEl) {
+    hintEl.textContent = hints[0];
+  }
 
   const hintTicker = setInterval(() => {
-    const el = $("loading-hint");
-    if (el && el.textContent === "Processing…") {
-      el.textContent = nextLocalHint();
-    }
-  }, 4000);
+    if (!hints.length || !hintEl) return;
+    hintIdx = (hintIdx + 1) % hints.length;
+    hintEl.textContent = hints[hintIdx];
+  }, hintRotateMs);
 
   const jobId = start.jobId;
 
@@ -447,12 +631,7 @@ async function uploadWithPolling(fd) {
           ? `Row ${st.current ?? 0} / ${st.total} · ${st.downloaded ?? 0} thumbnails`
           : "";
 
-      setLoadingProgress(
-        st.percent ?? 0,
-        st.phase || "download",
-        st.hint || nextLocalHint(),
-        count
-      );
+      setLoadingProgress(st.percent ?? 0, st.phase || "download", undefined, count);
 
       if (st.status === "complete" && st.result) {
         setLoadingProgress(100, "done", "Starting review…", count);
@@ -473,8 +652,9 @@ function resetForNewUpload() {
   sessionId = null;
   brandGroups = [];
   uncertainItems = [];
+  unavailableMedia = null;
   cursor = 0;
-  mode = "individual";
+  mode = "unavailable";
   reviewing = false;
   $("file-input").value = "";
   setStatus("");
@@ -514,12 +694,18 @@ async function submitReview(leftAction) {
   card.style.opacity = "0";
 
   try {
-    if (mode === "individual") {
-      await fetch(`/api/session/${sessionId}/review-item`, {
+    if (mode === "unavailable") {
+      await fetch(`/api/session/${sessionId}/review-unavailable`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ isFault: leftAction }),
+      });
+    } else if (mode === "uncertain") {
+      await fetch(`/api/session/${sessionId}/review-uncertain`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          rowIndex: item.rowIndex,
+          groupId: Number(item.groupId),
           advertiserMatch: !leftAction,
         }),
       });
@@ -560,24 +746,17 @@ let startX = 0;
 let currentX = 0;
 let dragging = false;
 
-card.addEventListener("pointerdown", (e) => {
-  if (reviewing || e.target.closest(".thumb-cell")) return;
-  dragging = true;
-  startX = e.clientX;
-  currentX = startX;
-  card.setPointerCapture(e.pointerId);
-});
-
-card.addEventListener("pointermove", (e) => {
+function onSwipePointerMove(e) {
   if (!dragging) return;
   currentX = e.clientX;
   const dx = currentX - startX;
   card.style.transform = `translateX(${dx}px) rotate(${dx * 0.05}deg)`;
   card.classList.toggle("swipe-left", dx < -40);
   card.classList.toggle("swipe-right", dx > 40);
-});
+}
 
-card.addEventListener("pointerup", () => {
+function endSwipeGesture() {
+  document.removeEventListener("pointermove", onSwipePointerMove);
   if (!dragging) return;
   dragging = false;
   const dx = currentX - startX;
@@ -587,7 +766,28 @@ card.addEventListener("pointerup", () => {
     card.style.transform = "";
     card.classList.remove("swipe-left", "swipe-right");
   }
-});
+}
+
+function bindSwipeZones() {
+  if (!card || card.dataset.swipeBound === "1") return;
+  card.dataset.swipeBound = "1";
+
+  card.addEventListener("pointerdown", (e) => {
+    if (reviewing || e.button !== 0) return;
+    if (e.target.closest(".thumb-cell, .thumb-grid")) return;
+    if (mode === "unavailable" && e.target.closest(".unavailable-table a")) return;
+    if (mode !== "unavailable" && !e.target.closest(".card-swipe-zone")) return;
+
+    dragging = true;
+    startX = e.clientX;
+    currentX = startX;
+    document.addEventListener("pointermove", onSwipePointerMove);
+    document.addEventListener("pointerup", endSwipeGesture, { once: true });
+  });
+}
+
+bindGridInteractions();
+bindSwipeZones();
 
 btnFault.addEventListener("click", () => submitReview(true));
 btnOk.addEventListener("click", () => submitReview(false));
@@ -596,7 +796,7 @@ $("export-btn-done").addEventListener("click", exportResults);
 $("upload-another-btn").addEventListener("click", resetForNewUpload);
 
 $("ctx-inspect").addEventListener("click", () => {
-  if (contextItem) openInspectModal(contextItem);
+  if (contextItem) openInspectModal(enrichInspectItem(contextItem));
 });
 $("inspect-close").addEventListener("click", closeInspectModal);
 $("inspect-modal").querySelector(".inspect-backdrop").addEventListener("click", closeInspectModal);
@@ -629,13 +829,25 @@ $("upload-form").addEventListener("submit", async (e) => {
 
     sessionId = data.sessionId;
     brandGroups = data.groups || [];
-    uncertainItems = data.uncertain || [];
+    uncertainItems = normalizeUncertainItems(data.uncertain || []);
+    unavailableMedia = data.unavailable || null;
     cursor = 0;
-    mode = uncertainItems.length > 0 ? "individual" : "brand";
+    mode = unavailableMedia
+      ? "unavailable"
+      : uncertainItems.length > 0
+        ? "uncertain"
+        : "brand";
 
-    setStatus(
-      `Loaded ${data.totalRows} rows · ${data.groupCount} brand(s) · ${data.uncertainCount} to verify individually`
-    );
+    const unavail = data.unavailableCount || 0;
+    let statusMsg =
+      `Loaded ${data.totalRows} rows · ${data.groupCount} brand group(s)` +
+      (unavail ? ` · ${unavail} unavailable` : "") +
+      (data.uncertainCount ? ` · ${data.uncertainCount} uncertain` : "");
+    const warnings = data.warnings || [];
+    if (warnings.length) {
+      statusMsg += ` · Warning: ${warnings[0]}`;
+    }
+    setStatus(statusMsg);
     uploadSection.classList.add("hidden");
     reviewSection.classList.remove("hidden");
     doneSection.classList.add("hidden");

@@ -11,7 +11,19 @@ BRAND_COLUMN_CANDIDATES = (
     "Brand",
     "vendor_brand",
     "vendorBrand",
+    "Vendor_Brand",
     "VENDOR_BRAND",
+    "Vendor Brand",
+    "VENDOR BRAND",
+)
+
+# Used for grouping when no BRAND / VENDOR_BRAND column exists
+BRAND_FALLBACK_COLUMN_CANDIDATES = (
+    "CREATIVE_CAMPAIGN_NAME",
+    "creative_campaign_name",
+    "Creative_Campaign_Name",
+    "CREATIVE_CAMPAGIN_NAME",  # common spreadsheet typo
+    "creative_campagin_name",
 )
 
 # Grey subtitle — ADVERTISER_NAME (not used for grouping key)
@@ -29,7 +41,19 @@ ADVERTISER_NAME_COLUMN_CANDIDATES = (
 )
 
 INSPECT_FIELD_MAP: list[tuple[str, list[str]]] = [
-    ("brand", ["brand", "BRAND", "Brand"]),
+    (
+        "brand",
+        [
+            "brand",
+            "BRAND",
+            "Brand",
+            "vendor_brand",
+            "VENDOR_BRAND",
+            "Vendor_Brand",
+            "CREATIVE_CAMPAIGN_NAME",
+            "creative_campaign_name",
+        ],
+    ),
     (
         "advertiser_name",
         ["ADVERTISER_NAME", "advertiser_name", "advertise_name", "Advertiser_Name"],
@@ -72,12 +96,31 @@ def _repair_legacy_export(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns={lower["advertise_name"]: "BRAND"})
 
 
-def detect_brand_column(columns: list[str]) -> str | None:
+def _column_from_candidates(
+    columns: list[str], candidates: tuple[str, ...]
+) -> str | None:
     lower = {c.lower(): c for c in columns}
-    for cand in BRAND_COLUMN_CANDIDATES:
+    for cand in candidates:
         if cand.lower() in lower:
             return lower[cand.lower()]
     return None
+
+
+def detect_brand_column(columns: list[str]) -> str | None:
+    col = _column_from_candidates(columns, BRAND_COLUMN_CANDIDATES)
+    if col:
+        return col
+    for col_name in columns:
+        normalized = col_name.lower().replace(" ", "_").replace("-", "_")
+        if normalized in ("vendor_brand", "vendorbrand"):
+            return col_name
+        if (
+            "vendor" in normalized
+            and "brand" in normalized
+            and "advertis" not in normalized
+        ):
+            return col_name
+    return _column_from_candidates(columns, BRAND_FALLBACK_COLUMN_CANDIDATES)
 
 
 def detect_advertiser_name_column(columns: list[str]) -> str | None:
@@ -99,11 +142,9 @@ def detect_advertiser_name_column(columns: list[str]) -> str | None:
 
 def brand_column_error(columns: list[str]) -> str:
     return (
-        "Brand column not found (expected BRAND or brand). "
-        "Advertiser subtitle uses ADVERTISER_NAME or advertiser_name. "
-        f"Columns: {columns}. "
-        "Use the original source spreadsheet, or export again from a session "
-        "started with a file that has BRAND."
+        "Brand column not found. Expected BRAND / VENDOR_BRAND, or fallback "
+        "CREATIVE_CAMPAIGN_NAME. Advertiser subtitle uses ADVERTISER_NAME. "
+        f"Columns: {columns}."
     )
 
 

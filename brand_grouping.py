@@ -8,7 +8,12 @@ from collections import Counter, defaultdict
 import imagehash
 from PIL import Image
 
+from grouping import KMeansGrouper, optimal_k
+from media import is_video_url
+
 OUTLIER_MIN_DISTANCE = 18
+MIN_VISUAL_SUBGROUP_SIZE = 2
+MIN_ITEMS_FOR_VISUAL_SUBGROUPING = 6
 
 
 def normalize_brand_key(name: str) -> str:
@@ -65,10 +70,105 @@ def find_visual_outliers(members: list[dict]) -> list[dict]:
     return [m for d, m in avg_distances if d > cutoff]
 
 
+def unavailable_media_reason(url: str) -> str:
+    return "Unavailable video" if is_video_url(url or "") else "Unavailable image"
+
+
+def _uncertain_reason_hint(reasons: set[str]) -> str:
+    labels = {
+        "visual_outlier": "Creatives look different from others in this brand.",
+        "missing_brand": "No brand label on these rows.",
+        "visual_singleton": "Creatives did not match a visual subgroup.",
+    }
+    if len(reasons) == 1:
+        return labels.get(next(iter(reasons)), "Verify brand labels for this group.")
+    return "Verify brand labels for this group."
+
+
+def _build_uncertain_groups(
+    uncertain_rows: list[dict],
+    to_items,
+) -> list[dict]:
+    """Group uncertain rows by brand so reviewers swipe per brand, not per creative."""
+    eligible = [
+        row
+        for row in uncertain_rows
+        if row.get("url") and row.get("thumb")
+    ]
+    by_brand: dict[str, list[dict]] = defaultdict(list)
+    for row in eligible:
+        key = normalize_brand_key(row.get("brandName") or "") or "__unknown__"
+        by_brand[key].append(row)
+
+    groups: list[dict] = []
+    sorted_keys = sorted(
+        by_brand.keys(),
+        key=lambda k: display_name(
+            [m["brandName"] for m in by_brand[k]], "Unknown brand"
+        ),
+    )
+    for group_id, key in enumerate(sorted_keys):
+        members = by_brand[key]
+        title = display_name([m["brandName"] for m in members], "Unknown brand")
+        subtitle = display_name(
+            [m.get("advertiserName") or "" for m in members],
+            "",
+        )
+        reasons = {m.get("uncertainReason", "review") for m in members}
+        for m in members:
+            m["needsIndividualReview"] = True
+
+        items = to_items(members)
+        groups.append(
+            {
+                "groupId": group_id,
+                "type": "uncertain",
+                "title": title,
+                "subtitle": subtitle,
+                "uncertainReason": next(iter(reasons)) if len(reasons) == 1 else "mixed",
+                "reasonHint": _uncertain_reason_hint(reasons),
+                "memberIndices": [int(m["index"]) for m in members],
+                "items": items,
+                "count": len(members),
+            }
+        )
+    return groups
+
+
+def build_unavailable_media(rows: list[dict]) -> dict | None:
+    entries = []
+    for row in rows:
+        if row.get("thumb") or not row.get("url"):
+            continue
+        url = row["url"]
+        fetch_detail = (row.get("thumbFetchDetail") or "").strip()
+        reason = unavailable_media_reason(url)
+        if fetch_detail:
+            reason = f"{reason} — {fetch_detail}"
+        entries.append(
+            {
+                "rowIndex": int(row["index"]),
+                "brand": row.get("brandName") or "",
+                "advertiserName": row.get("advertiserName") or "",
+                "creativeUrl": url,
+                "reason": reason,
+                "fetchDetail": fetch_detail,
+            }
+        )
+    if not entries:
+        return None
+    return {
+        "type": "unavailable",
+        "title": "Unavailable media",
+        "count": len(entries),
+        "entries": entries,
+    }
+
+
 def build_brand_groups(
     rows: list[dict],
     to_items,
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], dict | None]:
     by_brand: dict[str, list[dict]] = defaultdict(list)
     uncertain_rows: list[dict] = []
 
@@ -102,46 +202,69 @@ def build_brand_groups(
         if not brand_members:
             continue
 
-        title = display_name([m["brandName"] for m in brand_members], "Unknown brand")
-        subtitle = display_name(
-            [m.get("advertiserName") or "" for m in brand_members],
-            "",
-        )
+        # Optional second pass: within a single brand, split into multiple visual subgroups
+        # so colors/themes end up in separate review grids.
+        brand_title = display_name([m["brandName"] for m in brand_members], "Unknown brand")
+        brand_subtitle = display_name([m.get("advertiserName") or "" for m in brand_members], "")
 
+        with_thumb = [m for m in brand_members if m.get("thumb")]
         for m in brand_members:
-            m["groupId"] = gid
+            if not m.get("thumb"):
+                m["uncertainReason"] = "missing_thumb"
+                m["groupId"] = None
 
-        items = to_items(brand_members)
-        brand_groups.append(
-            {
-                "groupId": gid,
-                "type": "brand",
-                "title": title,
-                "subtitle": subtitle,
-                "memberIndices": [int(m["index"]) for m in brand_members],
-                "items": items,
-                "thumbs": [i["thumbUrl"] for i in items if i.get("thumbUrl")],
-                "count": len(brand_members),
-                "urls": [m["url"] for m in brand_members],
-            }
-        )
-        gid += 1
+        subgroups: list[list[dict]] = []
+        if len(with_thumb) >= MIN_ITEMS_FOR_VISUAL_SUBGROUPING:
+            thumb_paths = [m["thumb"] for m in with_thumb]
+            k = optimal_k(len(thumb_paths))
+            grouper = KMeansGrouper(k=k, resample=128)
+            cluster_ids = grouper.fit(thumb_paths, show_progress=False)
+            by_cluster: dict[int, list[dict]] = defaultdict(list)
+            for m, cid in zip(with_thumb, cluster_ids):
+                by_cluster[int(cid)].append(m)
 
-    uncertain_items: list[dict] = []
-    for item_id, row in enumerate(uncertain_rows):
-        row["needsIndividualReview"] = True
-        items = to_items([row])
-        uncertain_items.append(
-            {
-                "itemId": item_id,
-                "rowIndex": int(row["index"]),
-                "type": "individual",
-                "title": row.get("brandName") or "Unknown brand",
-                "subtitle": row.get("advertiserName") or "",
-                "uncertainReason": row.get("uncertainReason", "review"),
-                "items": items,
-                "count": 1,
-            }
-        )
+            # Keep meaningful subgroups; push singletons to individual review.
+            for cid, ms in sorted(by_cluster.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+                if len(ms) < MIN_VISUAL_SUBGROUP_SIZE:
+                    for m in ms:
+                        m["uncertainReason"] = "visual_singleton"
+                        m["groupId"] = None
+                        uncertain_rows.append(m)
+                else:
+                    subgroups.append(ms)
+        else:
+            subgroups = [with_thumb] if with_thumb else []
 
-    return brand_groups, uncertain_items
+        n_groups = len(subgroups)
+        for sg_i, members_in_group in enumerate(subgroups):
+            title = (
+                f"{brand_title} ({sg_i + 1}/{n_groups})"
+                if n_groups > 1
+                else brand_title
+            )
+            subtitle = brand_subtitle
+
+            for m in members_in_group:
+                m["groupId"] = gid
+
+            items = to_items(members_in_group)
+            brand_groups.append(
+                {
+                    "groupId": gid,
+                    "type": "brand",
+                    "title": title,
+                    "subtitle": subtitle,
+                    "memberIndices": [int(m["index"]) for m in members_in_group],
+                    "items": items,
+                    "thumbs": [i["thumbUrl"] for i in items if i.get("thumbUrl")],
+                    "count": len(members_in_group),
+                    "urls": [m["url"] for m in members_in_group],
+                }
+            )
+            gid += 1
+
+    uncertain_items = _build_uncertain_groups(uncertain_rows, to_items)
+
+    unavailable_media = build_unavailable_media(rows)
+
+    return brand_groups, uncertain_items, unavailable_media

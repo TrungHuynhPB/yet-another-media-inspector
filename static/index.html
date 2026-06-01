@@ -4,20 +4,20 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
   <title>Media Inspector</title>
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/style.css?v=3" />
 </head>
 <body>
   <div id="app">
     <header>
       <h1>Media Inspector</h1>
-      <p class="subtitle">Group by brand · verify uncertain ads · swipe or arrow keys</p>
+      <p class="subtitle">Group by brand · uncertain ads by brand · swipe or arrow keys</p>
     </header>
 
     <section id="upload-section">
       <form id="upload-form">
         <label class="file-label">
-          <input type="file" id="file-input" accept=".xlsx,.xls,.csv,.json" required />
-          <span>Choose Excel or JSON file</span>
+          <input type="file" id="file-input" accept=".xlsx,.xls,.csv,.json,text/csv" required />
+          <span>Choose Excel, CSV, or JSON file</span>
         </label>
         <label>
           URL column (optional — auto-detected)
@@ -55,17 +55,35 @@
 
       <div id="card-stack">
         <div id="card" class="card">
-          <h2 id="card-title" class="group-title"></h2>
-          <p id="card-subtitle" class="card-subtitle hidden"></p>
-          <p id="card-hint" class="card-hint hidden"></p>
+          <div class="card-swipe-zone">
+            <h2 id="card-title" class="group-title"></h2>
+            <p id="card-subtitle" class="card-subtitle hidden"></p>
+            <p id="card-hint" class="card-hint hidden"></p>
+          </div>
           <div id="card-grid" class="thumb-grid" aria-label="Creatives"></div>
           <div id="card-single" class="card-single hidden" aria-label="Creative"></div>
-          <div class="card-info">
-            <span id="card-count"></span>
+          <div id="card-unavailable" class="card-unavailable card-swipe-zone hidden" aria-label="Unavailable media">
+            <div class="unavailable-table-wrap">
+              <table class="unavailable-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Brand / Advertiser</th>
+                    <th scope="col">Creative URL</th>
+                    <th scope="col">Reason</th>
+                  </tr>
+                </thead>
+                <tbody id="unavailable-tbody"></tbody>
+              </table>
+            </div>
           </div>
-          <div class="swipe-hints">
-            <span id="hint-left" class="hint-left"></span>
-            <span id="hint-right" class="hint-right"></span>
+          <div class="card-swipe-zone card-swipe-zone--footer">
+            <div class="card-info">
+              <span id="card-count"></span>
+            </div>
+            <div class="swipe-hints">
+              <span id="hint-left" class="hint-left"></span>
+              <span id="hint-right" class="hint-right"></span>
+            </div>
           </div>
         </div>
       </div>
@@ -100,6 +118,6 @@
       </div>
     </div>
   </div>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=3"></script>
 </body>
 </html>

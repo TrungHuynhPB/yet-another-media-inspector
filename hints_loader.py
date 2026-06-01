@@ -5,12 +5,17 @@ from pathlib import Path
 
 HINT_FILE = Path(__file__).resolve().parent / "hint.md"
 
+# Each loading hint stays visible for this long before rotating (milliseconds).
+HINT_ROTATE_SECONDS = 15.5
+
 DEFAULT_HINTS = [
-    "Downloading creatives…",
-    "YAMI — grouping ads by brand.",
-    "Can YAMI load before the client meeting starts?",
+    "Downloading creatives… for YAMI - the No. 1 media inspector",
+    "YAMI — the best media inspector tool ever lived.",
+    "Media Inspector V2, V3 ? Maybe it works... Behold, YAMI - The chosen one.",
     "Extracting thumbnails from video URLs…",
     "Hang tight — large files take a few minutes.",
+    "In a world full of broken ETL pipelines… one inspector rises. - YAMI",
+    "❌ PAI Media Inspector V2; ❌ QueryBuilder; ❌ ESOV Tool; ❌ Akkio ETL; ✅ YAMI with 38 tabs open and still faster"
 ]
 
 
@@ -64,3 +69,7 @@ def load_hints() -> list[str]:
 
     combined = unique + DEFAULT_HINTS
     return combined[:40] if combined else list(DEFAULT_HINTS)
+
+
+def hint_rotate_ms() -> int:
+    return int(HINT_ROTATE_SECONDS * 1000)

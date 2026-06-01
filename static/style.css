@@ -22,9 +22,9 @@ body {
 }
 
 #app {
-  max-width: 720px;
+  max-width: min(1280px, 96vw);
   margin: 0 auto;
-  padding: 1.25rem;
+  padding: 1.25rem 1.5rem;
 }
 
 header {
@@ -139,7 +139,6 @@ header h1 {
   position: relative;
   min-height: 320px;
   margin-bottom: 1rem;
-  touch-action: none;
 }
 
 .card {
@@ -149,9 +148,27 @@ header h1 {
   overflow: hidden;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
   transition: transform 0.1s ease, opacity 0.2s;
-  user-select: none;
   display: flex;
   flex-direction: column;
+}
+
+.card-swipe-zone {
+  user-select: none;
+  touch-action: pan-x;
+  cursor: grab;
+}
+
+.card-swipe-zone--footer {
+  padding-top: 0.25rem;
+}
+
+.card-swipe-zone:active {
+  cursor: grabbing;
+}
+
+.card .thumb-grid {
+  touch-action: pan-y;
+  cursor: default;
 }
 
 .group-title {
@@ -164,12 +181,30 @@ header h1 {
 
 .thumb-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
-  gap: 8px;
-  padding: 0 0.75rem 0.75rem;
-  max-height: min(52vh, 420px);
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 12px;
+  padding: 0 1rem 1rem;
+  max-height: min(72vh, 680px);
   overflow-y: auto;
+  overflow-x: hidden;
   background: #0a0c10;
+  touch-action: pan-y;
+  position: relative;
+  z-index: 2;
+  pointer-events: auto;
+}
+
+@media (min-width: 900px) {
+  .thumb-grid {
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 14px;
+  }
+}
+
+@media (min-width: 1200px) {
+  .thumb-grid {
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  }
 }
 
 .thumb-cell {
@@ -184,6 +219,8 @@ header h1 {
   overflow: hidden;
   aspect-ratio: 1;
   transition: border-color 0.15s ease, transform 0.15s ease;
+  touch-action: manipulation;
+  pointer-events: auto;
 }
 
 .thumb-cell:hover {
@@ -232,6 +269,11 @@ header h1 {
   background: #0a0c10;
 }
 
+.card-single .single-media-cell {
+  pointer-events: auto;
+  cursor: context-menu;
+}
+
 .card-single img {
   width: 100%;
   max-height: min(50vh, 380px);
@@ -239,6 +281,62 @@ header h1 {
   border-radius: 8px;
   background: #000;
   pointer-events: none;
+}
+
+.card-unavailable {
+  padding: 0 0.75rem 0.75rem;
+  background: #0a0c10;
+}
+
+.unavailable-table-wrap {
+  max-height: min(52vh, 420px);
+  overflow: auto;
+  border: 1px solid var(--border, #2a3140);
+  border-radius: 8px;
+}
+
+.unavailable-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.78rem;
+}
+
+.unavailable-table thead {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #12151c;
+}
+
+.unavailable-table th,
+.unavailable-table td {
+  padding: 0.5rem 0.6rem;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid #222833;
+}
+
+.unavailable-table th {
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.unavailable-table tbody tr:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.unavailable-table a {
+  color: #7eb8ff;
+  word-break: break-all;
+}
+
+.unavailable-table a:hover {
+  text-decoration: underline;
+}
+
+.unavailable-table td:last-child {
+  color: var(--fault, #f07178);
+  white-space: nowrap;
 }
 
 .card-subtitle {
