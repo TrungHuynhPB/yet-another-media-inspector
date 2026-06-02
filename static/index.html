@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
   <title>YAMI — Yet Another Media Inspector</title>
   <link rel="icon" href="https://9smyv1sl5k76ziyp.public.blob.vercel-storage.com/whitelogo_plain.png" type="image/png" />
-  <link rel="stylesheet" href="/static/style.css?v=9" />
+  <link rel="stylesheet" href="/static/style.css?v=10" />
 </head>
 <body>
   <div id="app">
@@ -22,6 +22,10 @@
     </header>
 
     <section id="upload-section">
+      <div class="notice notice-warn" role="note" aria-label="Ad blocker notice">
+        <strong>Heads up:</strong> Ad blockers / privacy extensions can block media previews (AdClarity, TikTok, YouTube).
+        If thumbnails look unavailable, try disabling your blocker for this site, then refresh and re-upload.
+      </div>
       <form id="upload-form">
         <label class="file-label">
           <input type="file" id="file-input" accept=".xlsx,.xls,.csv,.json,text/csv" required />
