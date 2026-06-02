@@ -48,6 +48,27 @@ function setStatus(msg) {
   $("upload-status").textContent = msg;
 }
 
+function setFileSelectedName(name) {
+  const el = $("file-selected");
+  if (!el) return;
+  const trimmed = String(name || "").trim();
+  if (!trimmed) {
+    el.textContent = "";
+    el.classList.add("hidden");
+    return;
+  }
+  el.textContent = `Selected file: ${trimmed}`;
+  el.classList.remove("hidden");
+}
+
+function setReviewWait(show) {
+  const el = $("review-wait");
+  if (!el) return;
+  el.classList.toggle("hidden", !show);
+  btnFault.disabled = Boolean(show);
+  btnOk.disabled = Boolean(show);
+}
+
 function currentQueue() {
   if (mode === "unavailable") return unavailableMedia ? [unavailableMedia] : [];
   if (mode === "uncertain") return uncertainItems;
@@ -377,6 +398,7 @@ function setCardHeader({ title, subtitle, hint }) {
 
 function showCard() {
   reviewing = false;
+  setReviewWait(false);
   setUiForMode();
   const queue = currentQueue();
 
@@ -465,6 +487,28 @@ function finishReview() {
 
 function showLoading(show) {
   $("loading-overlay").classList.toggle("hidden", !show);
+}
+
+function postFormDataWithProgress(url, fd, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.responseType = "text";
+    xhr.upload.onprogress = (e) => {
+      if (!e.lengthComputable) return;
+      const ratio = e.total > 0 ? e.loaded / e.total : 0;
+      onProgress?.(ratio, e.loaded, e.total);
+    };
+    xhr.onload = () => {
+      resolve({
+        status: xhr.status,
+        ok: xhr.status >= 200 && xhr.status < 300,
+        text: xhr.responseText || "",
+      });
+    };
+    xhr.onerror = () => reject(new Error("Network error during upload"));
+    xhr.send(fd);
+  });
 }
 
 function phaseLabel(phase) {
@@ -649,9 +693,18 @@ async function uploadWithPolling(fd) {
   showLoading(true);
   setLoadingProgress(0, "starting", "Uploading file to server…", "");
 
-  const res = await fetch("/api/jobs", { method: "POST", body: fd });
-  const start = await parseJsonResponse(res);
-  if (!res.ok) {
+  const uploadRes = await postFormDataWithProgress("/api/jobs", fd, (ratio) => {
+    const pct = Math.max(0, Math.min(15, Math.round(ratio * 15)));
+    setLoadingProgress(pct, "receive", "Uploading file to server…", "");
+  });
+  let start;
+  try {
+    start = JSON.parse(uploadRes.text || "");
+  } catch {
+    showLoading(false);
+    throw new Error(`Invalid server response (${uploadRes.status})`);
+  }
+  if (!uploadRes.ok) {
     showLoading(false);
     throw new Error(start.detail || "Upload failed");
   }
@@ -721,6 +774,7 @@ function resetForNewUpload() {
   mode = "unavailable";
   reviewing = false;
   $("file-input").value = "";
+  setFileSelectedName("");
   setStatus("");
   doneSection.classList.add("hidden");
   reviewSection.classList.add("hidden");
@@ -758,6 +812,7 @@ async function submitReview(leftAction) {
   if (cursor >= queue.length) return;
 
   reviewing = true;
+  setReviewWait(true);
   const item = queue[cursor];
 
   card.classList.add(leftAction ? "swipe-left" : "swipe-right");
@@ -793,6 +848,7 @@ async function submitReview(leftAction) {
     setTimeout(showCard, 220);
   } catch {
     reviewing = false;
+    setReviewWait(false);
     card.style.transform = "";
     card.style.opacity = "1";
     card.classList.remove("swipe-left", "swipe-right");
@@ -867,6 +923,14 @@ btnOk.addEventListener("click", () => submitReview(false));
 $("export-btn").addEventListener("click", exportResults);
 $("export-btn-done").addEventListener("click", exportResults);
 $("upload-another-btn").addEventListener("click", resetForNewUpload);
+
+const fileInput = $("file-input");
+if (fileInput) {
+  fileInput.addEventListener("change", () => {
+    const f = fileInput.files && fileInput.files[0];
+    setFileSelectedName(f ? f.name : "");
+  });
+}
 
 $("ctx-inspect").addEventListener("click", () => {
   if (contextItem) openInspectModal(enrichInspectItem(contextItem));

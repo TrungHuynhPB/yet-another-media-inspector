@@ -27,6 +27,7 @@
           <input type="file" id="file-input" accept=".xlsx,.xls,.csv,.json,text/csv" required />
           <span>Choose Excel, CSV, or JSON file</span>
         </label>
+        <p id="file-selected" class="file-selected hidden"></p>
         <label>
           URL column (optional — auto-detected)
           <input type="text" id="url-column" placeholder="CREATIVE_URL_SUPPLIER" />
@@ -61,6 +62,7 @@
         <div id="progress-fill"></div>
       </div>
       <p id="progress-text"></p>
+      <p id="review-wait" class="review-wait hidden">Please wait a bit while YAMI grabs the next batch…</p>
 
       <div id="card-stack">
         <div id="card" class="card">
@@ -143,6 +145,6 @@
       </div>
     </div>
   </div>
-  <script src="/static/app.js?v=13"></script>
+  <script src="/static/app.js?v=14"></script>
 </body>
 </html>

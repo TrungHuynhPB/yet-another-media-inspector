@@ -138,6 +138,21 @@ header h1 {
   font-size: 0.95rem;
 }
 
+.file-selected {
+  margin: 0.55rem 0 0.2rem;
+  font-size: 0.85rem;
+  color: var(--text);
+  text-align: center;
+  opacity: 0.9;
+}
+
+.review-wait {
+  margin: 0.35rem 0 0.85rem;
+  text-align: center;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
 #upload-btn {
   background: var(--accent);
   color: #fff;
