@@ -40,11 +40,6 @@ logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
-try:
-    import vercel_blob  # type: ignore
-except Exception:  # pragma: no cover
-    vercel_blob = None
-
 
 def _is_serverless() -> bool:
     return bool(
@@ -65,11 +60,44 @@ DATA_DIR = Path(os.environ.get("YAMI_DATA_DIR", str(_default_data_dir())))
 JOBS_DIR = DATA_DIR / "jobs"
 SESSIONS_DIR = DATA_DIR / "sessions"
 
+_VERCEL_BLOB_API_BASE_URL = "https://blob.vercel-storage.com"
+_BLOB_API_VERSION = "10"
 _blob_index: dict[str, dict] = {}
 
 
 def _blob_enabled() -> bool:
-    return bool(_is_serverless() and vercel_blob is not None and os.environ.get("BLOB_READ_WRITE_TOKEN"))
+    # Uses the Blob REST API directly (no SDK dependency).
+    return bool(_is_serverless() and os.environ.get("BLOB_READ_WRITE_TOKEN"))
+
+
+def _blob_headers() -> dict[str, str]:
+    return {
+        "authorization": f"Bearer {os.environ.get('BLOB_READ_WRITE_TOKEN','')}",
+        "x-api-version": _BLOB_API_VERSION,
+        "access": "public",
+    }
+
+
+def _blob_list(prefix: str | None = None, *, limit: int = 1000) -> list[dict]:
+    if not _blob_enabled():
+        return []
+    params: dict[str, str] = {"limit": str(limit)}
+    if prefix:
+        params["prefix"] = prefix
+    try:
+        resp = httpx.get(
+            _VERCEL_BLOB_API_BASE_URL,
+            params=params,
+            headers=_blob_headers(),
+            timeout=15.0,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return list(data.get("blobs") or [])
+    except Exception as exc:
+        logger.warning("Blob list failed: %s", exc)
+        return []
 
 
 def _blob_find(pathname: str) -> dict | None:
@@ -78,14 +106,12 @@ def _blob_find(pathname: str) -> dict | None:
         return cached
     if not _blob_enabled():
         return None
-    try:
-        resp = vercel_blob.list({"limit": "1000"})
-        for b in resp.get("blobs", []) or []:
-            if b.get("pathname") == pathname:
-                _blob_index[pathname] = b
-                return b
-    except Exception as exc:
-        logger.warning("Blob list failed: %s", exc)
+    # Try listing only within the folder for speed.
+    prefix = pathname.split("/", 1)[0] + "/" if "/" in pathname else None
+    for b in _blob_list(prefix=prefix, limit=1000):
+        if b.get("pathname") == pathname:
+            _blob_index[pathname] = b
+            return b
     return None
 
 
@@ -109,11 +135,22 @@ def _blob_put_bytes(pathname: str, data: bytes, *, content_type: str) -> None:
     if not _blob_enabled():
         return
     try:
-        info = vercel_blob.put(
-            pathname,
-            data,
-            {"addRandomSuffix": "false", "contentType": content_type},
+        resp = httpx.post(
+            f"{_VERCEL_BLOB_API_BASE_URL}/",
+            params={"pathname": pathname},
+            headers={
+                **_blob_headers(),
+                "x-content-type": content_type,
+                "x-cache-control-max-age": "31536000",
+                "x-add-random-suffix": "0",
+                "x-allow-overwrite": "1",
+            },
+            content=data,
+            timeout=20.0,
+            follow_redirects=True,
         )
+        resp.raise_for_status()
+        info = resp.json()
         if isinstance(info, dict) and info.get("pathname"):
             _blob_index[info["pathname"]] = info
     except Exception as exc:
@@ -513,7 +550,7 @@ async def get_diagnostics():
     info["dataDirWritable"] = DATA_DIR.exists() and os.access(DATA_DIR, os.W_OK)
     info["blobEnabled"] = _blob_enabled()
     info["blobTokenPresent"] = bool(os.environ.get("BLOB_READ_WRITE_TOKEN"))
-    info["blobLibAvailable"] = vercel_blob is not None
+    info["blobLibAvailable"] = True
     return info
 
 

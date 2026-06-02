@@ -17,7 +17,6 @@ dependencies = [
     "python-multipart>=0.0.29",
     "tqdm>=4.67.3",
     "uvicorn[standard]>=0.48.0",
-    "vercel_blob>=0.4.2",
 ]
 
 [tool.vercel]
