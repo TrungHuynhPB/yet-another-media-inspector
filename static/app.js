@@ -663,6 +663,15 @@ function resetForNewUpload() {
   uploadSection.classList.remove("hidden");
 }
 
+function goHome(e) {
+  e?.preventDefault();
+  showLoading(false);
+  closeInspectModal();
+  closeCoffeeModal();
+  resetForNewUpload();
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
 async function parseJsonResponse(res) {
   const text = await res.text();
   if (!text) {
@@ -800,6 +809,47 @@ $("ctx-inspect").addEventListener("click", () => {
 });
 $("inspect-close").addEventListener("click", closeInspectModal);
 $("inspect-modal").querySelector(".inspect-backdrop").addEventListener("click", closeInspectModal);
+
+function setCoffeeTab(tabEl) {
+  document.querySelectorAll(".coffee-tab").forEach((btn) => {
+    const active = btn === tabEl;
+    btn.classList.toggle("active", active);
+    btn.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  const qr = $("coffee-qr");
+  const src = tabEl.dataset.qr;
+  const label = tabEl.id === "coffee-tab-vn" ? "Vietnam" : "Global";
+  qr.src = src;
+  qr.alt = `${label} payment QR code`;
+  const panel = $("coffee-qr-panel");
+  panel.setAttribute("aria-labelledby", tabEl.id);
+}
+
+function openCoffeeModal() {
+  setCoffeeTab($("coffee-tab-global"));
+  $("coffee-modal").classList.remove("hidden");
+}
+
+function closeCoffeeModal() {
+  $("coffee-modal").classList.add("hidden");
+}
+
+$("home-logo-link").addEventListener("click", goHome);
+
+$("bmc-link").addEventListener("click", (e) => {
+  e.preventDefault();
+  openCoffeeModal();
+});
+$("coffee-close").addEventListener("click", closeCoffeeModal);
+$("coffee-modal").querySelector(".coffee-backdrop").addEventListener("click", closeCoffeeModal);
+document.querySelectorAll(".coffee-tab").forEach((tab) => {
+  tab.addEventListener("click", () => setCoffeeTab(tab));
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("coffee-modal").classList.contains("hidden")) {
+    closeCoffeeModal();
+  }
+});
 
 $("context-menu").addEventListener("click", (e) => e.stopPropagation());
 document.addEventListener("click", () => hideContextMenu());

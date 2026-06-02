@@ -27,6 +27,58 @@ body {
   padding: 1.25rem 1.5rem;
 }
 
+.site-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.5rem;
+}
+
+.home-logo-link {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  line-height: 0;
+  border-radius: 8px;
+  transition: opacity 0.15s ease, background 0.15s ease;
+}
+
+.home-logo-link:hover {
+  opacity: 0.9;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.home-logo {
+  display: block;
+  width: auto;
+  height: 36px;
+  max-width: 88px;
+  object-fit: contain;
+}
+
+.bmc-link {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--accent);
+  text-decoration: none;
+  padding: 0.4rem 0.75rem;
+  border: 1px solid rgba(108, 140, 255, 0.45);
+  border-radius: 8px;
+  transition: background 0.15s ease;
+}
+
+.bmc-link:hover {
+  background: rgba(108, 140, 255, 0.14);
+}
+
+.header-logo {
+  display: block;
+  margin: 0 auto 0.75rem;
+  max-width: min(180px, 55vw);
+  height: auto;
+}
+
 header {
   text-align: center;
   margin-bottom: 1.5rem;
@@ -481,6 +533,14 @@ header h1 {
   text-align: center;
 }
 
+.loading-logo {
+  display: block;
+  width: min(200px, 72vw);
+  height: auto;
+  margin: 0 auto 1.25rem;
+  object-fit: contain;
+}
+
 .progress-ring {
   position: relative;
   width: 140px;
@@ -674,4 +734,66 @@ header h1 {
   line-height: 1.4;
   word-break: break-word;
   margin: 0;
+}
+
+/* Buy Me A Coffee modal */
+.coffee-panel {
+  width: min(400px, 100%);
+  text-align: center;
+}
+
+.coffee-subtitle {
+  color: var(--muted);
+  font-size: 0.9rem;
+  margin: -0.5rem 0 1rem;
+}
+
+.coffee-tabs {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: center;
+  margin-bottom: 1rem;
+}
+
+.coffee-tab {
+  flex: 1;
+  max-width: 140px;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid #3a4055;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+}
+
+.coffee-tab:hover {
+  color: var(--text);
+  border-color: rgba(108, 140, 255, 0.5);
+}
+
+.coffee-tab.active {
+  color: var(--text);
+  background: rgba(108, 140, 255, 0.18);
+  border-color: var(--accent);
+}
+
+.coffee-qr {
+  display: block;
+  width: min(320px, 100%);
+  height: auto;
+  margin: 0 auto;
+  border-radius: 12px;
+  background: #fff;
+  padding: 0.5rem;
+}
+
+.yami-logo path {
+    fill: none;
+    stroke: white;
+    stroke-width: 8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
 }

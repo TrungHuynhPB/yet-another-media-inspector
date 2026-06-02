@@ -3,13 +3,21 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
-  <title>Media Inspector</title>
-  <link rel="stylesheet" href="/static/style.css?v=3" />
+  <title>YAMI — Yet Another Media Inspector</title>
+  <link rel="icon" href="/static/whitelogo_plain.png" type="image/png" />
+  <link rel="stylesheet" href="/static/style.css?v=6" />
 </head>
 <body>
   <div id="app">
+    <div class="site-topbar">
+      <a href="/" id="home-logo-link" class="home-logo-link" aria-label="Back to homepage">
+        <img src="/static/whitelogo_plain.png" alt="YAMI home" class="home-logo" width="88" height="auto" />
+      </a>
+      <a href="#" id="bmc-link" class="bmc-link">Buy Me A Coffee</a>
+    </div>
     <header>
-      <h1>Media Inspector</h1>
+      <img src="/static/whitelogo.png" alt="YAMI logo" class="header-logo" width="150" height="auto" />
+      <h1>YAMI — Yet Another Media Inspector</h1>
       <p class="subtitle">Group by brand · uncertain ads by brand · swipe or arrow keys</p>
     </header>
 
@@ -29,6 +37,7 @@
 
       <div id="loading-overlay" class="loading-overlay hidden" aria-live="polite">
         <div class="loading-card">
+          <img src="/static/whitelogo.png" alt="YAMI" class="loading-logo" width="180" height="auto" />
           <div id="progress-ring" class="progress-ring" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
             <svg viewBox="0 0 120 120">
               <circle class="progress-ring-bg" cx="60" cy="60" r="52" />
@@ -117,7 +126,23 @@
         <dl id="inspect-meta" class="inspect-meta"></dl>
       </div>
     </div>
+
+    <div id="coffee-modal" class="inspect-modal coffee-modal hidden" role="dialog" aria-modal="true" aria-labelledby="coffee-title">
+      <div class="inspect-backdrop coffee-backdrop"></div>
+      <div class="inspect-panel coffee-panel">
+        <button type="button" id="coffee-close" class="inspect-close" aria-label="Close">✕</button>
+        <h2 id="coffee-title">Buy Me A Coffee</h2>
+        <p class="coffee-subtitle">Thank you for supporting YAMI</p>
+        <div class="coffee-tabs" role="tablist" aria-label="Payment region">
+          <button type="button" id="coffee-tab-global" class="coffee-tab active" role="tab" aria-selected="true" aria-controls="coffee-qr-panel" data-qr="/static/qr_global.jpg">Global</button>
+          <button type="button" id="coffee-tab-vn" class="coffee-tab" role="tab" aria-selected="false" aria-controls="coffee-qr-panel" data-qr="/static/qr.jpg">Vietnam</button>
+        </div>
+        <div id="coffee-qr-panel" role="tabpanel" aria-labelledby="coffee-tab-global">
+          <img id="coffee-qr" src="/static/qr_global.jpg" alt="Global payment QR code" class="coffee-qr" width="320" height="320" />
+        </div>
+      </div>
+    </div>
   </div>
-  <script src="/static/app.js?v=3"></script>
+  <script src="/static/app.js?v=6"></script>
 </body>
 </html>
