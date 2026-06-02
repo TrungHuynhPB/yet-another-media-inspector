@@ -1022,14 +1022,17 @@ async def review_group(session_id: str, body: dict):
 async def toggle_fault(session_id: str, body: dict):
     sess = _session_get(session_id)
     if not sess:
+        logger.info("toggle_fault: session_missing session_id=%s", session_id)
         raise HTTPException(404, "Session not found")
 
     row_index = body.get("rowIndex")
     if row_index is None:
+        logger.info("toggle_fault: rowIndex_missing session_id=%s", session_id)
         raise HTTPException(400, "rowIndex required")
     try:
         row_index = int(row_index)
     except Exception:
+        logger.info("toggle_fault: rowIndex_invalid session_id=%s rowIndex=%r", session_id, row_index)
         raise HTTPException(400, "rowIndex must be an integer") from None
 
     is_fault = body.get("isFault")
@@ -1039,7 +1042,13 @@ async def toggle_fault(session_id: str, body: dict):
                 is_fault = not row.get("isFault", False)
                 break
         else:
-            raise HTTPException(404, "Row not found")
+            logger.info(
+                "toggle_fault: row_missing_infer session_id=%s rowIndex=%s rows=%s",
+                session_id,
+                row_index,
+                len(sess.get("rows", [])),
+            )
+            raise HTTPException(422, "Row not found")
     else:
         is_fault = bool(is_fault)
 
@@ -1051,7 +1060,13 @@ async def toggle_fault(session_id: str, body: dict):
                 row["faultManual"] = False
             break
     else:
-        raise HTTPException(404, "Row not found")
+        logger.info(
+            "toggle_fault: row_missing_apply session_id=%s rowIndex=%s rows=%s",
+            session_id,
+            row_index,
+            len(sess.get("rows", [])),
+        )
+        raise HTTPException(422, "Row not found")
 
     _session_put(session_id, sess, full=False)
     return {"ok": True, "rowIndex": row_index, "isFault": is_fault}

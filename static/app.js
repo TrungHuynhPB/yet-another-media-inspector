@@ -504,19 +504,6 @@ function isVideoUrl(url) {
   return /\.(mp4|webm|mov|m4v)(\?|$)/i.test(url || "") || /_video\.mp4/i.test(url || "");
 }
 
-function isAdclarityUrl(url) {
-  return /adclarity/i.test(url || "");
-}
-
-function adclarityPosterFromMp4(url) {
-  const u = String(url || "");
-  if (!isAdclarityUrl(u) || !/\.mp4(\?|$)/i.test(u)) return "";
-  const [base, q] = u.split("?", 2);
-  let path = base.replace(/_video(?=\.mp4$)/i, "");
-  path = path.replace(/\.mp4$/i, ".jpeg");
-  return q ? `${path}?${q}` : path;
-}
-
 function openInspectModal(item) {
   hideContextMenu();
   const modal = $("inspect-modal");
@@ -526,13 +513,7 @@ function openInspectModal(item) {
   const thumb = item.thumbUrl || url;
 
   mediaEl.innerHTML = "";
-  if (isVideoUrl(url) && isAdclarityUrl(url)) {
-    // AdClarity MP4s are often hotlink-blocked on Vercel; show poster image instead.
-    const img = document.createElement("img");
-    img.referrerPolicy = "no-referrer";
-    img.src = thumb !== url ? thumb : adclarityPosterFromMp4(url) || url;
-    mediaEl.appendChild(img);
-  } else if (isVideoUrl(url)) {
+  if (isVideoUrl(url)) {
     const video = document.createElement("video");
     video.controls = true;
     video.referrerPolicy = "no-referrer";
