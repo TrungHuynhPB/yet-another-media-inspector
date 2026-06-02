@@ -292,13 +292,29 @@ def youtube_thumbnail_urls(url: str) -> list[str]:
             vid = m.group(1)
     if not vid:
         return []
-    return [
-        f"https://img.youtube.com/vi/{vid}/maxresdefault.jpg",
-        f"https://img.youtube.com/vi/{vid}/sddefault.jpg",
-        f"https://img.youtube.com/vi/{vid}/hqdefault.jpg",
-        f"https://img.youtube.com/vi/{vid}/mqdefault.jpg",
-        f"https://img.youtube.com/vi/{vid}/default.jpg",
+    # YouTube often returns a valid 200 for "maxresdefault" but it can be a
+    # placeholder image. We include multiple sizes and both jpg/webp hosts.
+    bases = [
+        f"https://i.ytimg.com/vi/{vid}",
+        f"https://img.youtube.com/vi/{vid}",
     ]
+    paths = [
+        "maxresdefault.jpg",
+        "maxresdefault.webp",
+        "sddefault.jpg",
+        "sddefault.webp",
+        "hqdefault.jpg",
+        "hqdefault.webp",
+        "mqdefault.jpg",
+        "mqdefault.webp",
+        "default.jpg",
+        "default.webp",
+        "0.jpg",
+        "1.jpg",
+        "2.jpg",
+        "3.jpg",
+    ]
+    return [f"{b}/{p}" for b in bases for p in paths]
 
 
 def tiktok_extract_info(url: str) -> tuple[str | None, str | None]:

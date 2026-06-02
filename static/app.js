@@ -6,6 +6,7 @@ let mode = "unavailable"; // unavailable | uncertain | brand
 let cursor = 0;
 let reviewing = false;
 let contextItem = null;
+let uploadedFilename = "";
 
 const RING_CIRCUMFERENCE = 2 * Math.PI * 52;
 
@@ -58,6 +59,19 @@ function setFileSelectedName(name) {
     return;
   }
   el.textContent = `Selected file: ${trimmed}`;
+  el.classList.remove("hidden");
+}
+
+function setReviewFilename(name) {
+  const el = $("review-filename");
+  if (!el) return;
+  const trimmed = String(name || "").trim();
+  if (!trimmed) {
+    el.textContent = "";
+    el.classList.add("hidden");
+    return;
+  }
+  el.textContent = `File: ${trimmed}`;
   el.classList.remove("hidden");
 }
 
@@ -483,6 +497,7 @@ function showCard() {
 function finishReview() {
   reviewSection.classList.add("hidden");
   doneSection.classList.remove("hidden");
+  $("export-btn")?.classList.add("hidden");
 }
 
 function showLoading(show) {
@@ -560,6 +575,28 @@ function isVideoUrl(url) {
   return /\.(mp4|webm|mov|m4v)(\?|$)/i.test(url || "") || /_video\.mp4/i.test(url || "");
 }
 
+function isYoutubeUrl(url) {
+  const u = String(url || "").toLowerCase();
+  return u.includes("youtu.be/") || u.includes("youtube.com/");
+}
+
+function youtubeVideoId(url) {
+  const u = String(url || "");
+  const mShort = u.match(/youtu\.be\/([^?/#]+)/i);
+  if (mShort) return mShort[1];
+  const mEmbed = u.match(/youtube\.com\/(?:embed|shorts|v)\/([^?/#]+)/i);
+  if (mEmbed) return mEmbed[1];
+  const mWatch = u.match(/[?&]v=([^&]+)/i);
+  if (mWatch) return mWatch[1];
+  return "";
+}
+
+function youtubeEmbedUrl(url) {
+  const id = youtubeVideoId(url);
+  if (!id) return "";
+  return `https://www.youtube-nocookie.com/embed/${encodeURIComponent(id)}?rel=0&modestbranding=1`;
+}
+
 function isAdclarityUrl(url) {
   return /adclarity/i.test(url || "");
 }
@@ -603,7 +640,23 @@ function openInspectModal(item) {
   const thumb = item.thumbUrl || url;
 
   mediaEl.innerHTML = "";
-  if (isVideoUrl(url)) {
+  if (isYoutubeUrl(url)) {
+    const embed = youtubeEmbedUrl(url);
+    if (embed) {
+      const iframe = document.createElement("iframe");
+      iframe.src = embed;
+      iframe.title = "YouTube video";
+      iframe.allow =
+        "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share";
+      iframe.allowFullscreen = true;
+      iframe.loading = "lazy";
+      iframe.referrerPolicy = "strict-origin-when-cross-origin";
+      iframe.style.width = "100%";
+      iframe.style.aspectRatio = "16 / 9";
+      iframe.style.border = "0";
+      mediaEl.appendChild(iframe);
+    }
+  } else if (isVideoUrl(url)) {
     const video = document.createElement("video");
     video.controls = true;
     video.referrerPolicy = "no-referrer";
@@ -775,6 +828,8 @@ function resetForNewUpload() {
   reviewing = false;
   $("file-input").value = "";
   setFileSelectedName("");
+  uploadedFilename = "";
+  setReviewFilename("");
   setStatus("");
   doneSection.classList.add("hidden");
   reviewSection.classList.add("hidden");
@@ -857,6 +912,10 @@ async function submitReview(leftAction) {
 
 function exportResults() {
   if (!sessionId) return;
+  if (!doneSection || doneSection.classList.contains("hidden")) {
+    setStatus("Export is available after review completes.");
+    return;
+  }
   window.location.href = `/api/session/${sessionId}/export`;
 }
 
@@ -997,6 +1056,9 @@ $("upload-form").addEventListener("submit", async (e) => {
   btn.disabled = true;
   setStatus("Downloading media and grouping by brand…");
 
+  uploadedFilename = fileInput.files[0]?.name || "";
+  setReviewFilename(uploadedFilename);
+
   const fd = new FormData();
   fd.append("file", fileInput.files[0]);
   fd.append("url_column", $("url-column").value.trim());
@@ -1029,6 +1091,7 @@ $("upload-form").addEventListener("submit", async (e) => {
     uploadSection.classList.add("hidden");
     reviewSection.classList.remove("hidden");
     doneSection.classList.add("hidden");
+    $("export-btn")?.classList.add("hidden");
     setUiForMode();
     showCard();
   } catch (err) {

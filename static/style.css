@@ -140,7 +140,7 @@ header h1 {
 
 .file-selected {
   margin: 0.55rem 0 0.2rem;
-  font-size: 2rem;
+  font-size: 0.85rem;
   color: var(--text);
   text-align: center;
   opacity: 0.9;
@@ -149,8 +149,15 @@ header h1 {
 .review-wait {
   margin: 0.35rem 0 0.85rem;
   text-align: center;
-  font-size: 2rem;
+  font-size: 0.85rem;
   color: var(--muted);
+}
+
+.review-filename {
+  margin: 0.1rem 0 1rem;
+  text-align: center;
+  font-size: 0.85rem;
+  color: rgba(255, 255, 255, 0.86);
 }
 
 #upload-btn {
