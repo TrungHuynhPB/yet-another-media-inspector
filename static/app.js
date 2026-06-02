@@ -829,8 +829,12 @@ async function uploadWithPolling(fd) {
   const jobId = start.jobId;
 
   try {
+    const pollStart = Date.now();
     while (true) {
-      await sleep(500);
+      const elapsed = Date.now() - pollStart;
+      // Faster early polling improves perceived progress on Vercel cold starts.
+      const pollMs = elapsed < 2500 ? 200 : 600;
+      await sleep(pollMs);
       const pollRes = await fetch(`/api/jobs/${jobId}`);
       const st = await parseJsonResponse(pollRes);
       if (!pollRes.ok) {
@@ -842,7 +846,22 @@ async function uploadWithPolling(fd) {
           ? `Row ${st.current ?? 0} / ${st.total} · ${st.downloaded ?? 0} thumbnails`
           : "";
 
-      setLoadingProgress(st.percent ?? 0, st.phase || "download", undefined, count);
+      const phase = st.phase || "download";
+      let pct = Number.isFinite(st.percent) ? Number(st.percent) : 0;
+      // Phase-based floor so UI doesn't feel stuck even if server percent is coarse.
+      if (phase === "parse") pct = Math.max(pct, 20);
+      else if (phase === "group") pct = Math.max(pct, 25);
+      else if (phase === "download") {
+        const total = Number(st.total || 0);
+        const cur = Number(st.current || 0);
+        if ((!pct || pct < 30) && total > 0) {
+          pct = 30 + Math.min(65, (cur / total) * 65); // 30 → 95
+        }
+        pct = Math.max(pct, 30);
+      }
+      // Never regress below upload progress segment.
+      pct = Math.max(pct, 15);
+      setLoadingProgress(pct, phase, undefined, count);
 
       if (st.status === "complete" && st.result) {
         setLoadingProgress(100, "done", "Starting review…", count);
