@@ -511,6 +511,9 @@ async def get_diagnostics():
     info["serverless"] = _is_serverless()
     info["dataDir"] = str(DATA_DIR)
     info["dataDirWritable"] = DATA_DIR.exists() and os.access(DATA_DIR, os.W_OK)
+    info["blobEnabled"] = _blob_enabled()
+    info["blobTokenPresent"] = bool(os.environ.get("BLOB_READ_WRITE_TOKEN"))
+    info["blobLibAvailable"] = vercel_blob is not None
     return info
 
 
