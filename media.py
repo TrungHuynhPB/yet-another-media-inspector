@@ -487,8 +487,30 @@ def is_image_bytes(data: bytes) -> bool:
     return False
 
 
+def _image_ext_from_bytes(data: bytes) -> str:
+    """Return a file extension (including dot) based on magic bytes."""
+    if not data:
+        return ".jpg"
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return ".jpg"
+
+
 def _existing_cached_thumb(cache_dir: Path, key: str) -> Path | None:
-    for name in (f"{key}_thumb.jpg", f"{key}_yt.jpg", f"{key}_tt.jpg"):
+    for name in (
+        f"{key}_thumb.jpg",
+        f"{key}_yt.jpg",
+        f"{key}_tt.jpg",
+        f"{key}_tt.webp",
+        f"{key}_tt.png",
+        f"{key}_tt.gif",
+    ):
         path = cache_dir / name
         if path.is_file() and path.stat().st_size > 0:
             return path
@@ -664,13 +686,15 @@ def _resolve_youtube_thumbnail(
 def _resolve_tiktok_thumbnail(
     client: httpx.Client, url: str, cache_dir: Path, key: str
 ) -> tuple[Path | None, str | None]:
-    out = cache_dir / f"{key}_tt.jpg"
-    if out.is_file() and out.stat().st_size > 0:
-        return out, None
+    for ext in (".jpg", ".webp", ".png", ".gif"):
+        out = cache_dir / f"{key}_tt{ext}"
+        if out.is_file() and out.stat().st_size > 0:
+            return out, None
 
     if is_tiktok_cdn_url(url):
         data = _try_download_image(client, url, timeout=30.0)
         if data:
+            out = cache_dir / f"{key}_tt{_image_ext_from_bytes(data)}"
             return save_bytes(out, data), None
         return None, "TikTok CDN image blocked or expired"
 
@@ -693,6 +717,7 @@ def _resolve_tiktok_thumbnail(
             return None, "TikTok oEmbed returned no thumbnail"
         data = _try_download_image(client, thumb_url, timeout=25.0)
         if data:
+            out = cache_dir / f"{key}_tt{_image_ext_from_bytes(data)}"
             return save_bytes(out, data), None
         return None, "TikTok thumbnail download failed"
     except Exception as exc:

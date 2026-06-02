@@ -150,10 +150,13 @@ function renderSingleImage(container, items) {
       isVideoUrl(mediaUrl) && isAdclarityUrl(mediaUrl)
         ? adclarityPosterFromMp4(mediaUrl)
         : "";
+    const ytId = isYoutubeUrl(mediaUrl) ? youtubeVideoId(mediaUrl) : "";
+    const ytThumb = ytId ? `https://i.ytimg.com/vi/${encodeURIComponent(ytId)}/mqdefault.jpg` : "";
     setImgSrcWithFallback(img, [
       thumbUrl,
       derivedPoster,
       derivedPoster ? adclarityJpgFromJpeg(derivedPoster) : "",
+      ytThumb,
       mediaUrl,
     ]);
 
@@ -284,10 +287,13 @@ function renderBrandGrid(container, items) {
       isVideoUrl(mediaUrl) && isAdclarityUrl(mediaUrl)
         ? adclarityPosterFromMp4(mediaUrl)
         : "";
+    const ytId = isYoutubeUrl(mediaUrl) ? youtubeVideoId(mediaUrl) : "";
+    const ytThumb = ytId ? `https://i.ytimg.com/vi/${encodeURIComponent(ytId)}/mqdefault.jpg` : "";
     setImgSrcWithFallback(img, [
       thumbUrl,
       derivedPoster,
       derivedPoster ? adclarityJpgFromJpeg(derivedPoster) : "",
+      ytThumb,
       mediaUrl,
     ]);
 
