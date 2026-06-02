@@ -219,7 +219,8 @@ def browser_headers_for_url(url: str) -> dict[str, str]:
 
 
 def is_adclarity_url(url: str) -> bool:
-    return "adclarity.com" in url.lower()
+    lower = (url or "").lower()
+    return "adclarity" in lower
 
 
 def is_video_url(url: str) -> bool:

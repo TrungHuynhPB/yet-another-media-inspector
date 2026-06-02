@@ -916,6 +916,10 @@ async def toggle_fault(session_id: str, body: dict):
     row_index = body.get("rowIndex")
     if row_index is None:
         raise HTTPException(400, "rowIndex required")
+    try:
+        row_index = int(row_index)
+    except Exception:
+        raise HTTPException(400, "rowIndex must be an integer") from None
 
     is_fault = body.get("isFault")
     if is_fault is None:
@@ -939,7 +943,7 @@ async def toggle_fault(session_id: str, body: dict):
         raise HTTPException(404, "Row not found")
 
     _session_put(session_id, sess, full=False)
-    return {"ok": True, "rowIndex": int(row_index), "isFault": is_fault}
+    return {"ok": True, "rowIndex": row_index, "isFault": is_fault}
 
 
 @app.post("/api/session/{session_id}/review-unavailable")
