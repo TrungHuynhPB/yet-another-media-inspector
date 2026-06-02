@@ -278,7 +278,12 @@ function applyFaultUi(item, cell, isFault) {
 }
 
 async function toggleImageFault(item, cell) {
-  const nextFault = !item.isFault;
+  if (cell.dataset.toggling === "1") return;
+  cell.dataset.toggling = "1";
+  const prevFault = Boolean(item.isFault);
+  const nextFault = !prevFault;
+  applyFaultUi(item, cell, nextFault);
+  updateGroupCountText();
   try {
     const res = await fetch(`/api/session/${sessionId}/toggle-fault`, {
       method: "POST",
@@ -288,10 +293,14 @@ async function toggleImageFault(item, cell) {
     const data = await parseJsonResponse(res);
     if (!res.ok) throw new Error(data.detail || "Update failed");
 
-    applyFaultUi(item, cell, data.isFault);
+    applyFaultUi(item, cell, Boolean(data.isFault));
     updateGroupCountText();
   } catch (err) {
+    applyFaultUi(item, cell, prevFault);
+    updateGroupCountText();
     setStatus(err.message || String(err));
+  } finally {
+    delete cell.dataset.toggling;
   }
 }
 

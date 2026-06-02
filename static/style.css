@@ -736,6 +736,17 @@ header h1 {
   margin: 0;
 }
 
+.inspect-meta dd a {
+  color: #fff;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.inspect-meta dd a:hover,
+.inspect-meta dd a:focus-visible {
+  color: rgba(255, 255, 255, 0.85);
+}
+
 /* Buy Me A Coffee modal */
 .coffee-panel {
   width: min(400px, 100%);

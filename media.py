@@ -21,6 +21,11 @@ CHROME_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36"
 )
+TIKTOK_MOBILE_USER_AGENT = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Version/17.0 Mobile/15E148 Safari/604.1"
+)
 ADCLARITY_ORIGIN = "https://ads.adclarity.com"
 
 _thread_local = threading.local()
@@ -163,28 +168,49 @@ def _host_request_slot(url: str):
         sem.release()
 
 
+def is_tiktok_cdn_url(url: str) -> bool:
+    lower = (url or "").lower()
+    return "tiktok" in lower and (
+        "tiktokcdn" in lower or "tiktokv.com" in lower or "tiktokcdn-us.com" in lower
+    )
+
+
 def browser_headers_for_url(url: str) -> dict[str, str]:
     """Headers that improve CDN hotlink fetches (e.g. Unilever, Adclarity)."""
     parsed = urlparse(url)
     host = (parsed.netloc or "").lower()
+    lower = url.lower()
     origin = f"{parsed.scheme or 'https'}://{parsed.netloc or host}"
     referer = f"{origin}/"
     extra: dict[str, str] = {}
+    user_agent = CHROME_USER_AGENT
     if "adclarity" in host:
         referer = f"{ADCLARITY_ORIGIN}/"
+        is_image = (
+            lower.endswith((".jpeg", ".jpg", ".png", ".webp"))
+            or "origin.image" in lower
+        )
         extra = {
             "Origin": ADCLARITY_ORIGIN,
-            "Sec-Fetch-Dest": "video" if is_video_url(url) else "image",
+            "Sec-Fetch-Dest": "image" if is_image else "video",
             "Sec-Fetch-Mode": "no-cors",
             "Sec-Fetch-Site": "cross-site",
         }
     elif "tiktok" in host:
         referer = "https://www.tiktok.com/"
+        user_agent = TIKTOK_MOBILE_USER_AGENT
+        extra = {
+            "Sec-Fetch-Dest": "image" if is_tiktok_cdn_url(url) else "document",
+            "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "cross-site",
+        }
     accept = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
-    if any(x in url.lower() for x in (".mp4", ".webm", ".mov", "video")):
+    if any(x in lower for x in (".mp4", ".webm", ".mov", "video")):
         accept = "*/*"
+    if lower.endswith((".jpeg", ".jpg")) or is_tiktok_cdn_url(url):
+        accept = "image/jpeg,image/*,*/*;q=0.8"
     return {
-        "User-Agent": CHROME_USER_AGENT,
+        "User-Agent": user_agent,
         "Accept": accept,
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": referer,
@@ -251,7 +277,10 @@ def is_youtube_url(url: str) -> bool:
 
 
 def is_tiktok_page_url(url: str) -> bool:
-    return "tiktok.com" in url.lower() and "adclarity" not in url.lower()
+    lower = (url or "").lower()
+    if "adclarity" in lower or is_tiktok_cdn_url(url):
+        return False
+    return "tiktok.com" in lower
 
 
 def youtube_thumbnail_urls(url: str) -> list[str]:
@@ -503,6 +532,55 @@ def _try_download_image(
     return None
 
 
+def _try_download_adclarity_poster(
+    client: httpx.Client, url: str, timeout: float = 45.0
+) -> tuple[bytes | None, str | None]:
+    """Fetch AdClarity .jpeg/.jpg sibling poster (MP4 → drop _video, .jpeg)."""
+    last_detail: str | None = None
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for candidate in adclarity_thumbnail_candidates(url):
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            candidates.append(candidate)
+    jpeg = adclarity_jpeg_from_mp4_url(url)
+    if jpeg and jpeg not in seen:
+        candidates.insert(0, jpeg)
+
+    for candidate in candidates:
+        headers = dict(browser_headers_for_url(candidate))
+        headers["Accept"] = "image/jpeg,image/jpg,image/*,*/*;q=0.8"
+        headers["Sec-Fetch-Dest"] = "image"
+        try:
+            resp = client.get(
+                candidate,
+                headers=headers,
+                timeout=timeout,
+                follow_redirects=True,
+            )
+            if resp.status_code in (403, 429):
+                last_detail = f"HTTP {resp.status_code} on poster URL"
+                time.sleep(1.0)
+                resp = client.get(
+                    candidate,
+                    headers=headers,
+                    timeout=timeout,
+                    follow_redirects=True,
+                )
+            resp.raise_for_status()
+            data = resp.content
+            if data and is_image_bytes(data):
+                return data, None
+            last_detail = f"poster not image bytes (HTTP {resp.status_code})"
+        except httpx.TimeoutException:
+            last_detail = "HTTP timeout on AdClarity poster URL"
+        except httpx.HTTPStatusError as exc:
+            last_detail = f"HTTP {exc.response.status_code} on AdClarity poster"
+        except httpx.HTTPError as exc:
+            last_detail = f"AdClarity poster fetch error: {exc}"
+    return None, last_detail
+
+
 def _fetch_partial_video(
     client: httpx.Client,
     url: str,
@@ -551,28 +629,36 @@ def _resolve_youtube_thumbnail(
 
 def _resolve_tiktok_thumbnail(
     client: httpx.Client, url: str, cache_dir: Path, key: str
-) -> Path | None:
+) -> tuple[Path | None, str | None]:
     out = cache_dir / f"{key}_tt.jpg"
     if out.is_file() and out.stat().st_size > 0:
-        return out
+        return out, None
+
+    if is_tiktok_cdn_url(url):
+        data = _try_download_image(client, url, timeout=30.0)
+        if data:
+            return save_bytes(out, data), None
+        return None, "TikTok CDN image blocked or expired"
+
     oembed = tiktok_oembed_url(url)
+    headers = browser_headers_for_url("https://www.tiktok.com/")
     try:
-        resp = client.get(
-            oembed,
-            timeout=15.0,
-            headers=browser_headers_for_url("https://www.tiktok.com/"),
-        )
+        resp = client.get(oembed, timeout=15.0, headers=headers)
         if resp.status_code != 200:
-            return None
+            return (
+                None,
+                "TikTok Shop / mobile-only link (oEmbed unavailable from server)",
+            )
         thumb_url = resp.json().get("thumbnail_url")
         if not thumb_url:
-            return None
+            return None, "TikTok oEmbed returned no thumbnail"
         data = _try_download_image(client, thumb_url, timeout=25.0)
         if data:
-            return save_bytes(out, data)
-    except Exception as e:
-        print(f"TikTok oEmbed failed {url}: {e}")
-    return None
+            return save_bytes(out, data), None
+        return None, "TikTok thumbnail download failed"
+    except Exception as exc:
+        print(f"TikTok oEmbed failed {url}: {exc}")
+        return None, "TikTok Shop / mobile-only link (thumbnail unavailable)"
 
 
 def _resolve_video_poster(
@@ -587,7 +673,17 @@ def _resolve_video_poster(
     if thumb_jpg.is_file() and thumb_jpg.stat().st_size > 0:
         return thumb_jpg, None
 
+    last_detail: str | None = None
     image_timeout = 45.0 if is_adclarity_url(url) else 30.0
+
+    if is_adclarity_url(url):
+        data, poster_detail = _try_download_adclarity_poster(
+            client, url, timeout=image_timeout
+        )
+        if data:
+            return save_bytes(thumb_jpg, data), None
+        last_detail = poster_detail
+
     for candidate in static_candidates or []:
         if candidate == url:
             continue
@@ -596,20 +692,19 @@ def _resolve_video_poster(
             return save_bytes(thumb_jpg, data), None
 
     if not opencv_available():
-        return None, opencv_unavailable_reason()
+        return None, opencv_unavailable_reason() or last_detail
 
     if is_adclarity_url(url):
         ok, probe_detail = _probe_media_url(client, url)
         if not ok:
-            print(f"AdClarity probe failed {url[:80]}: {probe_detail}")
-            return None, probe_detail
+            print(f"AdClarity MP4 probe failed {url[:80]}: {probe_detail}")
+            last_detail = last_detail or probe_detail
+        # Continue — poster may work even when MP4 probe fails from datacenter IP.
 
     ext = extension_from_url(url)
     video_timeout = (
         adclarity_video_download_timeout() if is_adclarity_url(url) else 90.0
     )
-    last_detail: str | None = None
-
     partial_path, partial_detail = _fetch_partial_video(
         client, url, cache_dir, key, ext
     )
@@ -695,10 +790,17 @@ def resolve_thumbnail_with_client(
         if yt:
             return yt, None
 
+    if is_tiktok_cdn_url(url):
+        data = _try_download_image(client, url, timeout=30.0)
+        if data:
+            return save_bytes(thumb_jpg, data), None
+        return None, "TikTok CDN image blocked or expired"
+
     if is_tiktok_page_url(url):
-        tt = _resolve_tiktok_thumbnail(client, url, cache_dir, key)
+        tt, tt_detail = _resolve_tiktok_thumbnail(client, url, cache_dir, key)
         if tt:
             return tt, None
+        return None, tt_detail
 
     if is_video_url(url) or ext in VIDEO_EXTENSIONS:
         poster, detail = _resolve_video_poster(
@@ -727,9 +829,10 @@ def resolve_thumbnail_with_client(
             if yt:
                 return yt, None
         if is_tiktok_page_url(url):
-            tt = _resolve_tiktok_thumbnail(client, url, cache_dir, key)
+            tt, tt_detail = _resolve_tiktok_thumbnail(client, url, cache_dir, key)
             if tt:
                 return tt, None
+            return None, tt_detail or "image download failed"
         return None, "image download failed or not image bytes"
 
     data, fetch_detail = _fetch_bytes_sync(
@@ -739,9 +842,11 @@ def resolve_thumbnail_with_client(
         if is_youtube_url(url):
             yt = _resolve_youtube_thumbnail(client, url, cache_dir, key)
             return yt, None if yt else fetch_detail
-        if is_tiktok_page_url(url):
-            tt = _resolve_tiktok_thumbnail(client, url, cache_dir, key)
-            return tt, None if tt else fetch_detail
+        if is_tiktok_page_url(url) or is_tiktok_cdn_url(url):
+            tt, tt_detail = _resolve_tiktok_thumbnail(client, url, cache_dir, key)
+            if tt:
+                return tt, None
+            return None, tt_detail or fetch_detail
         return None, fetch_detail
 
     if is_image_bytes(data):
@@ -771,9 +876,9 @@ def resolve_thumbnail_with_client(
     if is_youtube_url(url):
         yt = _resolve_youtube_thumbnail(client, url, cache_dir, key)
         return yt, None if yt else "YouTube thumbnail not found"
-    if is_tiktok_page_url(url):
-        tt = _resolve_tiktok_thumbnail(client, url, cache_dir, key)
-        return tt, None if tt else "TikTok thumbnail not found"
+    if is_tiktok_page_url(url) or is_tiktok_cdn_url(url):
+        tt, tt_detail = _resolve_tiktok_thumbnail(client, url, cache_dir, key)
+        return tt, tt_detail
     return None, "unsupported media type"
 
 

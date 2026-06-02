@@ -102,26 +102,72 @@ _sessions: dict[str, dict] = {}
 _jobs: dict[str, dict] = {}
 
 
+def _faults_path(session_id: str) -> Path:
+    return SESSIONS_DIR / f"{session_id}.faults.json"
+
+
+def _faults_snapshot(sess: dict) -> dict:
+    return {
+        "faults": {
+            str(r["index"]): {
+                "isFault": bool(r.get("isFault")),
+                "faultManual": bool(r.get("faultManual")),
+            }
+            for r in sess.get("rows", [])
+        }
+    }
+
+
+def _merge_faults_snapshot(sess: dict, snapshot: dict) -> None:
+    faults = snapshot.get("faults") or {}
+    for row in sess.get("rows", []):
+        state = faults.get(str(row["index"]))
+        if state is None:
+            continue
+        row["isFault"] = bool(state.get("isFault"))
+        row["faultManual"] = bool(state.get("faultManual"))
+
+
+def _write_faults_snapshot(session_id: str, sess: dict) -> None:
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    _faults_path(session_id).write_text(
+        json.dumps(_faults_snapshot(sess)), encoding="utf-8"
+    )
+
+
 def _session_get(session_id: str) -> dict | None:
     if session_id in _sessions:
-        return _sessions[session_id]
-    path = SESSIONS_DIR / f"{session_id}.pkl"
-    if path.is_file():
+        sess = _sessions[session_id]
+    else:
+        path = SESSIONS_DIR / f"{session_id}.pkl"
+        if not path.is_file():
+            return None
         try:
             sess = pickle.loads(path.read_bytes())
             _sessions[session_id] = sess
-            return sess
         except Exception as exc:
             logger.exception("Failed to load session %s: %s", session_id, exc)
-    return None
+            return None
 
-
-def _session_put(session_id: str, sess: dict) -> None:
-    _sessions[session_id] = sess
     if _is_serverless():
-        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        fp = _faults_path(session_id)
+        if fp.is_file():
+            try:
+                _merge_faults_snapshot(sess, json.loads(fp.read_text(encoding="utf-8")))
+            except Exception as exc:
+                logger.warning("Failed to merge faults for %s: %s", session_id, exc)
+    return sess
+
+
+def _session_put(session_id: str, sess: dict, *, full: bool = True) -> None:
+    _sessions[session_id] = sess
+    if not _is_serverless():
+        return
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    if full:
         path = SESSIONS_DIR / f"{session_id}.pkl"
         path.write_bytes(pickle.dumps(sess, protocol=pickle.HIGHEST_PROTOCOL))
+    _write_faults_snapshot(session_id, sess)
 
 
 def _job_get(job_id: str) -> dict | None:
@@ -856,7 +902,7 @@ async def review_group(session_id: str, body: dict):
                 row["reviewed"] = True
 
     sess["group_cursor"] = min(sess["group_cursor"] + 1, len(sess["groups"]))
-    _session_put(session_id, sess)
+    _session_put(session_id, sess, full=True)
 
     return {"ok": True, "cursor": sess["group_cursor"]}
 
@@ -892,7 +938,7 @@ async def toggle_fault(session_id: str, body: dict):
     else:
         raise HTTPException(404, "Row not found")
 
-    _session_put(session_id, sess)
+    _session_put(session_id, sess, full=False)
     return {"ok": True, "rowIndex": int(row_index), "isFault": is_fault}
 
 
@@ -918,7 +964,7 @@ async def review_unavailable(session_id: str, body: dict):
                 row["isFault"] = True
 
     sess["unavailable_reviewed"] = True
-    _session_put(session_id, sess)
+    _session_put(session_id, sess, full=True)
     return {"ok": True, "count": len(indices)}
 
 
@@ -954,7 +1000,7 @@ async def review_uncertain_group(session_id: str, body: dict):
     sess["uncertain_cursor"] = min(
         sess["uncertain_cursor"] + 1, len(sess.get("uncertain", []))
     )
-    _session_put(session_id, sess)
+    _session_put(session_id, sess, full=True)
     return {"ok": True, "cursor": sess["uncertain_cursor"]}
 
 
@@ -983,7 +1029,7 @@ async def review_item(session_id: str, body: dict):
     sess["uncertain_cursor"] = min(
         sess["uncertain_cursor"] + 1, len(sess.get("uncertain", []))
     )
-    _session_put(session_id, sess)
+    _session_put(session_id, sess, full=True)
 
     return {"ok": True, "cursor": sess["uncertain_cursor"]}
 
