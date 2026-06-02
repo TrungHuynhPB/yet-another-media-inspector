@@ -580,6 +580,11 @@ function isYoutubeUrl(url) {
   return u.includes("youtu.be/") || u.includes("youtube.com/");
 }
 
+function isTikTokUrl(url) {
+  const u = String(url || "").toLowerCase();
+  return u.includes("tiktok.com/");
+}
+
 function youtubeVideoId(url) {
   const u = String(url || "");
   const mShort = u.match(/youtu\.be\/([^?/#]+)/i);
@@ -640,7 +645,26 @@ function openInspectModal(item) {
   const thumb = item.thumbUrl || url;
 
   mediaEl.innerHTML = "";
-  if (isYoutubeUrl(url)) {
+  if (isTikTokUrl(url)) {
+    const img = document.createElement("img");
+    img.referrerPolicy = "no-referrer";
+    img.src = thumb;
+    img.style.cursor = "pointer";
+    img.title = "Open TikTok in new tab";
+    img.addEventListener("click", () => {
+      if (url) window.open(url, "_blank", "noopener,noreferrer");
+    });
+    if (thumb !== url && url) {
+      img.addEventListener(
+        "error",
+        () => {
+          img.src = url;
+        },
+        { once: true }
+      );
+    }
+    mediaEl.appendChild(img);
+  } else if (isYoutubeUrl(url)) {
     const embed = youtubeEmbedUrl(url);
     if (embed) {
       const iframe = document.createElement("iframe");

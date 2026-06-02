@@ -319,13 +319,27 @@ def youtube_thumbnail_urls(url: str) -> list[str]:
 
 def tiktok_extract_info(url: str) -> tuple[str | None, str | None]:
     try:
-        parts = urlparse(url).path.strip("/").split("/")
-        if len(parts) < 2:
+        path = urlparse(url).path.strip("/")
+        parts = [p for p in path.split("/") if p]
+        if not parts:
             return None, None
-        channel = parts[0].lstrip("@")
-        video_id = parts[-1]
-        if not str(video_id).isdigit():
-            video_id = tiktok_video_id(url) or video_id
+
+        # Common shape: /@channel/video/<id>
+        channel = None
+        video_id = None
+        if "video" in parts:
+            i = parts.index("video")
+            if i + 1 < len(parts):
+                video_id = parts[i + 1]
+            if i - 1 >= 0:
+                channel = parts[i - 1].lstrip("@")
+        else:
+            # Fallback to the old heuristic.
+            channel = parts[0].lstrip("@") if len(parts) >= 2 else None
+            video_id = parts[-1]
+
+        if not (video_id and str(video_id).isdigit()):
+            video_id = tiktok_video_id(url) or None
         if not channel or not video_id:
             return None, None
         return channel, video_id
@@ -661,14 +675,19 @@ def _resolve_tiktok_thumbnail(
         return None, "TikTok CDN image blocked or expired"
 
     oembed = tiktok_oembed_url(url)
-    headers = browser_headers_for_url("https://www.tiktok.com/")
+    headers = browser_headers_for_url(oembed)
     try:
-        resp = client.get(oembed, timeout=15.0, headers=headers)
+        resp = client.get(oembed, timeout=20.0, headers=headers)
         if resp.status_code != 200:
-            return (
-                None,
-                "TikTok Shop / mobile-only link (oEmbed unavailable from server)",
-            )
+            # Some TikTok URLs only work via the "quoted original URL" form.
+            fallback = tiktok_oembed_url(url)
+            if fallback != oembed:
+                resp = client.get(fallback, timeout=20.0, headers=headers)
+            if resp.status_code != 200:
+                return (
+                    None,
+                    "TikTok link unavailable (oEmbed blocked / mobile-only)",
+                )
         thumb_url = resp.json().get("thumbnail_url")
         if not thumb_url:
             return None, "TikTok oEmbed returned no thumbnail"
