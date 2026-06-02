@@ -1,9 +1,9 @@
 """K-means image grouping (from groupimg.py), usable as a library."""
 
 import math
+import os
 import warnings
-from multiprocessing import cpu_count
-from multiprocessing.dummy import Pool as ThreadPool
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from PIL import Image
@@ -31,11 +31,13 @@ class KMeansGrouper:
         if self._i >= self.k:
             self._i = 0
         try:
-            img = Image.open(path)
-            osize = img.size
-            img.thumbnail((self.resample, self.resample))
-            hist = np.histogram(np.asarray(img))[0]
-            v = [float(p) / float(img.size[0] * img.size[1]) * 100 for p in hist]
+            with Image.open(path) as img:
+                osize = img.size
+                thumb = img.copy()
+                thumb.thumbnail((self.resample, self.resample))
+                tw, th = thumb.size
+                hist = np.histogram(np.asarray(thumb))[0]
+            v = [float(p) / float(max(tw * th, 1)) * 100 for p in hist]
             if self.size:
                 v += [osize[0], osize[1]]
             if self._pbar:
@@ -69,10 +71,9 @@ class KMeansGrouper:
 
         self._i = 0
         self._pbar = tqdm(total=len(image_paths), disable=not show_progress)
-        pool = ThreadPool(cpu_count())
-        result = pool.map(self.read_image, image_paths)
-        pool.close()
-        pool.join()
+        workers = min(8, len(image_paths), os.cpu_count() or 4)
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+            result = list(executor.map(self.read_image, image_paths))
         self._pbar.close()
         self._pbar = None
 
