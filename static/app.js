@@ -111,10 +111,16 @@ function renderSingleImage(container, items) {
     img.referrerPolicy = "no-referrer";
     const mediaUrl = item.mediaUrl || item.thumbUrl;
     const thumbUrl = item.thumbUrl;
-    img.src = thumbUrl || mediaUrl;
-    if (thumbUrl && mediaUrl && thumbUrl !== mediaUrl) {
-      img.addEventListener("error", () => { img.src = mediaUrl; }, { once: true });
-    }
+    const derivedPoster =
+      isVideoUrl(mediaUrl) && isAdclarityUrl(mediaUrl)
+        ? adclarityPosterFromMp4(mediaUrl)
+        : "";
+    setImgSrcWithFallback(img, [
+      thumbUrl,
+      derivedPoster,
+      derivedPoster ? adclarityJpgFromJpeg(derivedPoster) : "",
+      mediaUrl,
+    ]);
 
     cell.appendChild(img);
     cell._item = item;
@@ -239,10 +245,16 @@ function renderBrandGrid(container, items) {
     img.referrerPolicy = "no-referrer";
     const mediaUrl = item.mediaUrl || item.thumbUrl;
     const thumbUrl = item.thumbUrl;
-    img.src = thumbUrl || mediaUrl;
-    if (thumbUrl && mediaUrl && thumbUrl !== mediaUrl) {
-      img.addEventListener("error", () => { img.src = mediaUrl; }, { once: true });
-    }
+    const derivedPoster =
+      isVideoUrl(mediaUrl) && isAdclarityUrl(mediaUrl)
+        ? adclarityPosterFromMp4(mediaUrl)
+        : "";
+    setImgSrcWithFallback(img, [
+      thumbUrl,
+      derivedPoster,
+      derivedPoster ? adclarityJpgFromJpeg(derivedPoster) : "",
+      mediaUrl,
+    ]);
 
     const overlay = document.createElement("div");
     overlay.className = "fault-overlay";
@@ -502,6 +514,40 @@ function openContextMenu(x, y, item) {
 
 function isVideoUrl(url) {
   return /\.(mp4|webm|mov|m4v)(\?|$)/i.test(url || "") || /_video\.mp4/i.test(url || "");
+}
+
+function isAdclarityUrl(url) {
+  return /adclarity/i.test(url || "");
+}
+
+function adclarityPosterFromMp4(url) {
+  const u = String(url || "");
+  if (!/\.mp4(\?|$)/i.test(u)) return "";
+  const [base, q] = u.split("?", 2);
+  let path = base.replace(/_video(?=\.mp4$)/i, "");
+  path = path.replace(/\.mp4$/i, ".jpeg");
+  return q ? `${path}?${q}` : path;
+}
+
+function adclarityJpgFromJpeg(url) {
+  const u = String(url || "");
+  return u.replace(/\.jpeg(\?|$)/i, ".jpg$1");
+}
+
+function setImgSrcWithFallback(img, sources) {
+  const list = (sources || []).filter(Boolean);
+  let i = 0;
+  const advance = () => {
+    while (i < list.length && img.src === list[i]) i += 1;
+    if (i >= list.length) return false;
+    img.src = list[i];
+    i += 1;
+    return true;
+  };
+  img.onerror = () => {
+    if (!advance()) img.onerror = null;
+  };
+  advance();
 }
 
 function openInspectModal(item) {
