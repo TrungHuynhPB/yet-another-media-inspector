@@ -135,7 +135,8 @@ def _blob_put_bytes(pathname: str, data: bytes, *, content_type: str) -> None:
     if not _blob_enabled():
         return
     try:
-        resp = httpx.post(
+        # Vercel Blob upload uses PUT /?pathname=...
+        resp = httpx.put(
             f"{_VERCEL_BLOB_API_BASE_URL}/",
             params={"pathname": pathname},
             headers={
@@ -242,6 +243,11 @@ def _session_get(session_id: str) -> dict | None:
                 _ensure_data_dirs()
                 path.write_bytes(data)
         if not path.is_file():
+            logger.info(
+                "session_get: missing session_id=%s blobEnabled=%s",
+                session_id,
+                _blob_enabled(),
+            )
             return None
         try:
             sess = pickle.loads(path.read_bytes())

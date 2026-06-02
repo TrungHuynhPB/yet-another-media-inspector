@@ -332,7 +332,10 @@ def adclarity_jpeg_from_mp4_url(url: str) -> str | None:
     AdClarity MP4 → JPEG sibling URL: drop `_video` before `.mp4`, use `.jpeg`.
     e.g. …/abc_video.mp4 → …/abc.jpeg
     """
-    if not is_adclarity_url(url) or ".mp4" not in url.lower():
+    lower = (url or "").lower()
+    # Some AdClarity video URLs are on CDN hosts that don't include adclarity.com.
+    # Still apply the sibling poster rule when the path looks like AdClarity's pattern.
+    if ".mp4" not in lower:
         return None
     base, sep, query = url.partition("?")
     path = re.sub(r"_video(?=\.mp4)", "", base, flags=re.IGNORECASE)
