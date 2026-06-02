@@ -615,6 +615,15 @@ async function uploadWithPolling(fd) {
     hintEl.textContent = hints[hintIdx];
   }, hintRotateMs);
 
+  if (start.status === "complete" && start.result) {
+    setLoadingProgress(100, "done", "Starting review…", "");
+    await sleep(300);
+    return start.result;
+  }
+  if (start.status === "error" && start.error) {
+    throw new Error(start.error);
+  }
+
   const jobId = start.jobId;
 
   try {

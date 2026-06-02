@@ -3,6 +3,8 @@
 import asyncio
 import json
 import logging
+import os
+import pickle
 import sys
 import uuid
 from collections.abc import AsyncIterator
@@ -36,8 +38,28 @@ from media import (
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
 STATIC_DIR = BASE_DIR / "static"
+
+
+def _is_serverless() -> bool:
+    return bool(os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV"))
+
+
+def _default_data_dir() -> Path:
+    if _is_serverless():
+        return Path("/tmp/yami-data")
+    return BASE_DIR / "data"
+
+
+DATA_DIR = Path(os.environ.get("YAMI_DATA_DIR", str(_default_data_dir())))
+JOBS_DIR = DATA_DIR / "jobs"
+SESSIONS_DIR = DATA_DIR / "sessions"
+
+
+def _ensure_data_dirs() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="YAMI Media Inspector")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -53,6 +75,11 @@ def _opencv_warning() -> str:
 
 @app.on_event("startup")
 async def _check_opencv_on_startup() -> None:
+    _ensure_data_dirs()
+    if _is_serverless():
+        logger.info("Serverless mode: DATA_DIR=%s", DATA_DIR)
+        os.environ.setdefault("YAMI_THUMBNAIL_WORKERS", "12")
+        os.environ.setdefault("YAMI_ADCLARITY_MAX_PARALLEL", "3")
     diag = opencv_diagnostics()
     logger.info("Python: %s", diag["pythonExecutable"])
     if diag.get("opencvAvailable"):
@@ -68,6 +95,48 @@ def _opencv_warnings() -> list[str]:
 
 _sessions: dict[str, dict] = {}
 _jobs: dict[str, dict] = {}
+
+
+def _session_get(session_id: str) -> dict | None:
+    if session_id in _sessions:
+        return _sessions[session_id]
+    path = SESSIONS_DIR / f"{session_id}.pkl"
+    if path.is_file():
+        try:
+            sess = pickle.loads(path.read_bytes())
+            _sessions[session_id] = sess
+            return sess
+        except Exception as exc:
+            logger.exception("Failed to load session %s: %s", session_id, exc)
+    return None
+
+
+def _session_put(session_id: str, sess: dict) -> None:
+    _sessions[session_id] = sess
+    if _is_serverless():
+        path = SESSIONS_DIR / f"{session_id}.pkl"
+        path.write_bytes(pickle.dumps(sess, protocol=pickle.HIGHEST_PROTOCOL))
+
+
+def _job_get(job_id: str) -> dict | None:
+    if job_id in _jobs:
+        return _jobs[job_id]
+    path = JOBS_DIR / f"{job_id}.json"
+    if path.is_file():
+        try:
+            job = json.loads(path.read_text(encoding="utf-8"))
+            _jobs[job_id] = job
+            return job
+        except Exception as exc:
+            logger.exception("Failed to load job %s: %s", job_id, exc)
+    return None
+
+
+def _job_set(job_id: str, job: dict) -> None:
+    _jobs[job_id] = job
+    if _is_serverless():
+        path = JOBS_DIR / f"{job_id}.json"
+        path.write_text(json.dumps(job, default=str), encoding="utf-8")
 
 
 def _session_dir(session_id: str) -> Path:
@@ -255,19 +324,22 @@ def _finalize_session(
     if not group_list and not uncertain_list and not unavailable_media:
         raise HTTPException(400, "No groupable rows found.")
 
-    _sessions[session_id] = {
-        "df": df,
-        "url_column": col,
-        "brand_column": brand_col,
-        "adv_column": adv_col,
-        "rows": rows,
-        "groups": group_list,
-        "uncertain": uncertain_list,
-        "unavailable": unavailable_media,
-        "group_cursor": 0,
-        "uncertain_cursor": 0,
-        "unavailable_reviewed": False,
-    }
+    _session_put(
+        session_id,
+        {
+            "df": df,
+            "url_column": col,
+            "brand_column": brand_col,
+            "adv_column": adv_col,
+            "rows": rows,
+            "groups": group_list,
+            "uncertain": uncertain_list,
+            "unavailable": unavailable_media,
+            "group_cursor": 0,
+            "uncertain_cursor": 0,
+            "unavailable_reviewed": False,
+        },
+    )
 
     return {
         "sessionId": session_id,
@@ -297,13 +369,18 @@ async def get_hints():
 @app.get("/api/diagnostics")
 async def get_diagnostics():
     """Environment check (OpenCV / Python path) — useful when video thumbs all fail."""
-    return opencv_diagnostics()
+    info = opencv_diagnostics()
+    info["serverless"] = _is_serverless()
+    info["dataDir"] = str(DATA_DIR)
+    info["dataDirWritable"] = DATA_DIR.exists() and os.access(DATA_DIR, os.W_OK)
+    return info
 
 
 def _job_update(job_id: str, **fields) -> None:
-    job = _jobs.get(job_id)
+    job = _job_get(job_id)
     if job:
         job.update(fields)
+        _job_set(job_id, job)
 
 
 async def _process_job(
@@ -315,7 +392,9 @@ async def _process_job(
     meta_lookup: dict,
     cache_dir: Path,
 ) -> None:
-    job = _jobs[job_id]
+    job = _job_get(job_id)
+    if not job:
+        return
     hints = load_hints()
     hint_i = 0
 
@@ -414,44 +493,69 @@ async def create_job(
     file: UploadFile = File(...),
     url_column: str = Form(""),
 ):
-    """Start background processing; poll GET /api/jobs/{id} for progress."""
-    raw = await file.read()
-    df = await asyncio.to_thread(_load_dataframe, raw, file.filename or "")
-    col, brand_col, adv_col = _resolve_columns(df, url_column)
-    meta_lookup = column_lookup(df)
+    """Start processing; poll GET /api/jobs/{id} unless serverless returns result inline."""
+    try:
+        _ensure_data_dirs()
+        raw = await file.read()
+        df = await asyncio.to_thread(_load_dataframe, raw, file.filename or "")
+        col, brand_col, adv_col = _resolve_columns(df, url_column)
+        meta_lookup = column_lookup(df)
 
-    job_id = str(uuid.uuid4())
-    cache_dir = _session_dir(job_id) / "cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+        job_id = str(uuid.uuid4())
+        cache_dir = _session_dir(job_id) / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
 
-    _jobs[job_id] = {
-        "status": "running",
-        "phase": "starting",
-        "percent": 2,
-        "hint": "File received — starting…",
-        "current": 0,
-        "total": len(df),
-        "downloaded": 0,
-        "error": None,
-        "result": None,
-    }
+        _job_set(
+            job_id,
+            {
+                "status": "running",
+                "phase": "starting",
+                "percent": 2,
+                "hint": "File received — starting…",
+                "current": 0,
+                "total": len(df),
+                "downloaded": 0,
+                "error": None,
+                "result": None,
+            },
+        )
 
-    asyncio.create_task(
-        _process_job(job_id, df, col, brand_col, adv_col, meta_lookup, cache_dir)
-    )
+        base_payload = {
+            "jobId": job_id,
+            "total": len(df),
+            "hints": load_hints(),
+            "hintRotateMs": hint_rotate_ms(),
+            "warnings": _opencv_warnings(),
+        }
 
-    return {
-        "jobId": job_id,
-        "total": len(df),
-        "hints": load_hints(),
-        "hintRotateMs": hint_rotate_ms(),
-        "warnings": _opencv_warnings(),
-    }
+        if _is_serverless():
+            await _process_job(
+                job_id, df, col, brand_col, adv_col, meta_lookup, cache_dir
+            )
+            job = _job_get(job_id) or {}
+            return {
+                **base_payload,
+                "status": job.get("status", "error"),
+                "result": job.get("result"),
+                "error": job.get("error"),
+            }
+
+        asyncio.create_task(
+            _process_job(
+                job_id, df, col, brand_col, adv_col, meta_lookup, cache_dir
+            )
+        )
+        return base_payload
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("create_job failed")
+        raise HTTPException(500, str(exc)) from exc
 
 
 @app.get("/api/jobs/{job_id}")
 async def get_job_status(job_id: str):
-    job = _jobs.get(job_id)
+    job = _job_get(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
 
@@ -488,6 +592,7 @@ async def upload_stream(
 
     async def events() -> AsyncIterator[str]:
         try:
+            _ensure_data_dirs()
             yield _stream_line(
                 {
                     "type": "progress",
@@ -678,8 +783,9 @@ async def upload(
 
 
 async def _process_upload(file: UploadFile, url_column: str):
+    _ensure_data_dirs()
     raw = await file.read()
-    df = _load_dataframe(raw, file.filename or "")
+    df = await asyncio.to_thread(_load_dataframe, raw, file.filename or "")
     col, brand_col, adv_col = _resolve_columns(df, url_column)
     meta_lookup = column_lookup(df)
     session_id = str(uuid.uuid4())
@@ -700,7 +806,7 @@ async def serve_thumb(session_id: str, filename: str):
 
 @app.post("/api/session/{session_id}/review")
 async def review_group(session_id: str, body: dict):
-    sess = _sessions.get(session_id)
+    sess = _session_get(session_id)
     if not sess:
         raise HTTPException(404, "Session not found")
 
@@ -724,13 +830,14 @@ async def review_group(session_id: str, body: dict):
                 row["reviewed"] = True
 
     sess["group_cursor"] = min(sess["group_cursor"] + 1, len(sess["groups"]))
+    _session_put(session_id, sess)
 
     return {"ok": True, "cursor": sess["group_cursor"]}
 
 
 @app.post("/api/session/{session_id}/toggle-fault")
 async def toggle_fault(session_id: str, body: dict):
-    sess = _sessions.get(session_id)
+    sess = _session_get(session_id)
     if not sess:
         raise HTTPException(404, "Session not found")
 
@@ -759,13 +866,14 @@ async def toggle_fault(session_id: str, body: dict):
     else:
         raise HTTPException(404, "Row not found")
 
+    _session_put(session_id, sess)
     return {"ok": True, "rowIndex": int(row_index), "isFault": is_fault}
 
 
 @app.post("/api/session/{session_id}/review-unavailable")
 async def review_unavailable(session_id: str, body: dict):
     """Mark all unavailable-media rows reviewed after the single table swipe."""
-    sess = _sessions.get(session_id)
+    sess = _session_get(session_id)
     if not sess:
         raise HTTPException(404, "Session not found")
 
@@ -784,13 +892,14 @@ async def review_unavailable(session_id: str, body: dict):
                 row["isFault"] = True
 
     sess["unavailable_reviewed"] = True
+    _session_put(session_id, sess)
     return {"ok": True, "count": len(indices)}
 
 
 @app.post("/api/session/{session_id}/review-uncertain")
 async def review_uncertain_group(session_id: str, body: dict):
     """Confirm or reject brand labels for all creatives in an uncertain brand group."""
-    sess = _sessions.get(session_id)
+    sess = _session_get(session_id)
     if not sess:
         raise HTTPException(404, "Session not found")
 
@@ -819,13 +928,14 @@ async def review_uncertain_group(session_id: str, body: dict):
     sess["uncertain_cursor"] = min(
         sess["uncertain_cursor"] + 1, len(sess.get("uncertain", []))
     )
+    _session_put(session_id, sess)
     return {"ok": True, "cursor": sess["uncertain_cursor"]}
 
 
 @app.post("/api/session/{session_id}/review-item")
 async def review_item(session_id: str, body: dict):
     """Confirm whether the creative matches its advertiser label (single row)."""
-    sess = _sessions.get(session_id)
+    sess = _session_get(session_id)
     if not sess:
         raise HTTPException(404, "Session not found")
 
@@ -847,13 +957,14 @@ async def review_item(session_id: str, body: dict):
     sess["uncertain_cursor"] = min(
         sess["uncertain_cursor"] + 1, len(sess.get("uncertain", []))
     )
+    _session_put(session_id, sess)
 
     return {"ok": True, "cursor": sess["uncertain_cursor"]}
 
 
 @app.get("/api/session/{session_id}/export")
 async def export_xlsx(session_id: str):
-    sess = _sessions.get(session_id)
+    sess = _session_get(session_id)
     if not sess:
         raise HTTPException(404, "Session not found")
 
