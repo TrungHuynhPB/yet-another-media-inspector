@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import statistics
 from collections import Counter, defaultdict
+from pathlib import Path
 
 import imagehash
 from PIL import Image
@@ -207,6 +208,10 @@ def build_brand_groups(
         brand_title = display_name([m["brandName"] for m in brand_members], "Unknown brand")
         brand_subtitle = display_name([m.get("advertiserName") or "" for m in brand_members], "")
 
+        for m in brand_members:
+            thumb = m.get("thumb")
+            if thumb and not Path(thumb).is_file():
+                m["thumb"] = None
         with_thumb = [m for m in brand_members if m.get("thumb")]
         for m in brand_members:
             if not m.get("thumb"):
@@ -215,12 +220,13 @@ def build_brand_groups(
 
         subgroups: list[list[dict]] = []
         if len(with_thumb) >= MIN_ITEMS_FOR_VISUAL_SUBGROUPING:
-            thumb_paths = [m["thumb"] for m in with_thumb]
+            with_thumb_valid = [m for m in with_thumb if Path(m["thumb"]).is_file()]
+            thumb_paths = [m["thumb"] for m in with_thumb_valid]
             k = optimal_k(len(thumb_paths))
             grouper = KMeansGrouper(k=k, resample=128)
             cluster_ids = grouper.fit(thumb_paths, show_progress=False)
             by_cluster: dict[int, list[dict]] = defaultdict(list)
-            for m, cid in zip(with_thumb, cluster_ids):
+            for m, cid in zip(with_thumb_valid, cluster_ids):
                 by_cluster[int(cid)].append(m)
 
             # Keep meaningful subgroups; push singletons to individual review.

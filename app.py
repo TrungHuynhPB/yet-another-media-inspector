@@ -42,7 +42,12 @@ STATIC_DIR = BASE_DIR / "static"
 
 
 def _is_serverless() -> bool:
-    return bool(os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV"))
+    return bool(
+        os.environ.get("VERCEL")
+        or os.environ.get("VERCEL_ENV")
+        or os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
+        or os.environ.get("LAMBDA_TASK_ROOT")
+    )
 
 
 def _default_data_dir() -> Path:
@@ -114,6 +119,7 @@ def _session_get(session_id: str) -> dict | None:
 def _session_put(session_id: str, sess: dict) -> None:
     _sessions[session_id] = sess
     if _is_serverless():
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
         path = SESSIONS_DIR / f"{session_id}.pkl"
         path.write_bytes(pickle.dumps(sess, protocol=pickle.HIGHEST_PROTOCOL))
 
@@ -135,12 +141,25 @@ def _job_get(job_id: str) -> dict | None:
 def _job_set(job_id: str, job: dict) -> None:
     _jobs[job_id] = job
     if _is_serverless():
+        JOBS_DIR.mkdir(parents=True, exist_ok=True)
         path = JOBS_DIR / f"{job_id}.json"
         path.write_text(json.dumps(job, default=str), encoding="utf-8")
 
 
 def _session_dir(session_id: str) -> Path:
     return DATA_DIR / session_id
+
+
+def _validated_thumb(
+    thumb: Path | None, url: str, fetch_failures: dict[str, str]
+) -> Path | None:
+    if not thumb:
+        return None
+    path = Path(thumb)
+    if path.is_file() and path.stat().st_size > 0:
+        return path
+    fetch_failures.setdefault(url, "thumbnail file missing after download")
+    return None
 
 
 def _cell_str(value) -> str:
@@ -287,7 +306,9 @@ async def _download_rows(
     rows: list[dict] = []
     row_downloaded = 0
     for idx, url in enumerate(urls):
-        thumb = thumb_by_url.get(url) if url else None
+        thumb = _validated_thumb(
+            thumb_by_url.get(url) if url else None, url, fetch_failures
+        )
         if thumb:
             row_downloaded += 1
         detail = fetch_failures.get(url) if url and not thumb else None
@@ -453,7 +474,9 @@ async def _process_job(
 
         rows = []
         for idx, url in enumerate(urls):
-            thumb = thumb_by_url.get(url) if url else None
+            thumb = _validated_thumb(
+                thumb_by_url.get(url) if url else None, url, fetch_failures
+            )
             detail = fetch_failures.get(url) if url and not thumb else None
             rows.append(
                 _make_row(
@@ -550,7 +573,8 @@ async def create_job(
         raise
     except Exception as exc:
         logger.exception("create_job failed")
-        raise HTTPException(500, str(exc)) from exc
+        detail = f"{type(exc).__name__}: {exc}"
+        raise HTTPException(500, detail) from exc
 
 
 @app.get("/api/jobs/{job_id}")
@@ -699,7 +723,9 @@ async def upload_stream(
             rows = []
             downloaded = 0
             for idx, url in enumerate(urls):
-                thumb = thumb_by_url.get(url) if url else None
+                thumb = _validated_thumb(
+                    thumb_by_url.get(url) if url else None, url, fetch_failures
+                )
                 if thumb:
                     downloaded += 1
                 detail = fetch_failures.get(url) if url and not thumb else None

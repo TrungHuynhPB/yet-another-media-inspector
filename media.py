@@ -804,16 +804,28 @@ def resolve_thumbnails_batch(
     downloaded = 0
 
     def fetch_one(url: str) -> tuple[str, Path | None, str | None]:
-        with _host_request_slot(url):
-            client = _thread_http_client()
-            path, detail = resolve_thumbnail_with_client(url, cache_dir, client)
-            return url, path, detail
+        try:
+            with _host_request_slot(url):
+                client = _thread_http_client()
+                path, detail = resolve_thumbnail_with_client(url, cache_dir, client)
+                if path and not path.is_file():
+                    return url, None, "thumbnail file missing after download"
+                return url, path, detail
+        except Exception as exc:
+            return url, None, str(exc)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(fetch_one, url) for url in unique_urls]
+        future_to_url = {
+            pool.submit(fetch_one, url): url for url in unique_urls
+        }
         done = 0
-        for fut in as_completed(futures):
-            url, path, detail = fut.result()
+        for fut in as_completed(future_to_url):
+            url = future_to_url[fut]
+            try:
+                _url, path, detail = fut.result()
+            except Exception as exc:
+                logger.exception("Thumbnail worker failed for %s", url)
+                path, detail = None, str(exc)
             results[url] = path
             if not path and detail:
                 failures[url] = detail
