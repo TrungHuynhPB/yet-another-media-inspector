@@ -28,11 +28,13 @@ from metadata import (
 )
 from media import (
     detect_url_column,
+    is_youtube_url,
     opencv_available,
     opencv_diagnostics,
     opencv_unavailable_reason,
     resolve_thumbnails_batch,
     thumbnail_concurrency,
+    youtube_video_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -332,6 +334,13 @@ def _cell_str(value) -> str:
 def _thumb_url(session_id: str, thumb_path: str) -> str:
     return f"/api/thumb/{session_id}/{Path(thumb_path).name}"
 
+def _youtube_ui_thumb(url: str) -> str | None:
+    vid = youtube_video_id(url)
+    if not vid:
+        return None
+    # 320x180 is a good balance for the grid.
+    return f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
+
 
 def _member_items(session_id: str, members: list[dict]) -> list[dict]:
     items = []
@@ -346,6 +355,10 @@ def _member_items(session_id: str, members: list[dict]) -> list[dict]:
         }
         if m.get("thumb"):
             item["thumbUrl"] = _thumb_url(session_id, m["thumb"])
+        elif is_youtube_url(m["url"]):
+            yt = _youtube_ui_thumb(m["url"])
+            if yt:
+                item["thumbUrl"] = yt
         items.append(item)
     return items
 
