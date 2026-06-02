@@ -40,6 +40,11 @@ logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 
+try:
+    import vercel_blob  # type: ignore
+except Exception:  # pragma: no cover
+    vercel_blob = None
+
 
 def _is_serverless() -> bool:
     return bool(
@@ -59,6 +64,60 @@ def _default_data_dir() -> Path:
 DATA_DIR = Path(os.environ.get("YAMI_DATA_DIR", str(_default_data_dir())))
 JOBS_DIR = DATA_DIR / "jobs"
 SESSIONS_DIR = DATA_DIR / "sessions"
+
+_blob_index: dict[str, dict] = {}
+
+
+def _blob_enabled() -> bool:
+    return bool(_is_serverless() and vercel_blob is not None and os.environ.get("BLOB_READ_WRITE_TOKEN"))
+
+
+def _blob_find(pathname: str) -> dict | None:
+    cached = _blob_index.get(pathname)
+    if cached:
+        return cached
+    if not _blob_enabled():
+        return None
+    try:
+        resp = vercel_blob.list({"limit": "1000"})
+        for b in resp.get("blobs", []) or []:
+            if b.get("pathname") == pathname:
+                _blob_index[pathname] = b
+                return b
+    except Exception as exc:
+        logger.warning("Blob list failed: %s", exc)
+    return None
+
+
+def _blob_get_bytes(pathname: str, *, timeout: float = 20.0) -> bytes | None:
+    blob = _blob_find(pathname)
+    if not blob:
+        return None
+    url = blob.get("downloadUrl") or blob.get("url")
+    if not url:
+        return None
+    try:
+        r = httpx.get(url, timeout=timeout, follow_redirects=True)
+        r.raise_for_status()
+        return r.content
+    except Exception as exc:
+        logger.warning("Blob download failed %s: %s", pathname, exc)
+        return None
+
+
+def _blob_put_bytes(pathname: str, data: bytes, *, content_type: str) -> None:
+    if not _blob_enabled():
+        return
+    try:
+        info = vercel_blob.put(
+            pathname,
+            data,
+            {"addRandomSuffix": "false", "contentType": content_type},
+        )
+        if isinstance(info, dict) and info.get("pathname"):
+            _blob_index[info["pathname"]] = info
+    except Exception as exc:
+        logger.warning("Blob put failed %s: %s", pathname, exc)
 
 
 def _ensure_data_dirs() -> None:
@@ -130,9 +189,9 @@ def _merge_faults_snapshot(sess: dict, snapshot: dict) -> None:
 
 def _write_faults_snapshot(session_id: str, sess: dict) -> None:
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    _faults_path(session_id).write_text(
-        json.dumps(_faults_snapshot(sess)), encoding="utf-8"
-    )
+    payload = json.dumps(_faults_snapshot(sess)).encode("utf-8")
+    _faults_path(session_id).write_bytes(payload)
+    _blob_put_bytes(f"sessions/{session_id}.faults.json", payload, content_type="application/json")
 
 
 def _session_get(session_id: str) -> dict | None:
@@ -140,6 +199,11 @@ def _session_get(session_id: str) -> dict | None:
         sess = _sessions[session_id]
     else:
         path = SESSIONS_DIR / f"{session_id}.pkl"
+        if not path.is_file() and _blob_enabled():
+            data = _blob_get_bytes(f"sessions/{session_id}.pkl", timeout=25.0)
+            if data:
+                _ensure_data_dirs()
+                path.write_bytes(data)
         if not path.is_file():
             return None
         try:
@@ -151,6 +215,11 @@ def _session_get(session_id: str) -> dict | None:
 
     if _is_serverless():
         fp = _faults_path(session_id)
+        if not fp.is_file() and _blob_enabled():
+            data = _blob_get_bytes(f"sessions/{session_id}.faults.json", timeout=15.0)
+            if data:
+                _ensure_data_dirs()
+                fp.write_bytes(data)
         if fp.is_file():
             try:
                 _merge_faults_snapshot(sess, json.loads(fp.read_text(encoding="utf-8")))
@@ -166,7 +235,9 @@ def _session_put(session_id: str, sess: dict, *, full: bool = True) -> None:
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     if full:
         path = SESSIONS_DIR / f"{session_id}.pkl"
-        path.write_bytes(pickle.dumps(sess, protocol=pickle.HIGHEST_PROTOCOL))
+        data = pickle.dumps(sess, protocol=pickle.HIGHEST_PROTOCOL)
+        path.write_bytes(data)
+        _blob_put_bytes(f"sessions/{session_id}.pkl", data, content_type="application/octet-stream")
     _write_faults_snapshot(session_id, sess)
 
 
