@@ -27,6 +27,17 @@ BRAND_FALLBACK_COLUMN_CANDIDATES = (
 )
 
 # Grey subtitle — ADVERTISER_NAME (not used for grouping key)
+IS_FAULTY_COLUMN_CANDIDATES = (
+    "isFaulty",
+    "IS_FAULTY",
+    "is_faulty",
+    "IsFaulty",
+    "isFault",
+    "IS_FAULT",
+    "isfault",
+    "isfaulty",
+)
+
 ADVERTISER_NAME_COLUMN_CANDIDATES = (
     "ADVERTISER_NAME",
     "advertiser_name",
@@ -121,6 +132,27 @@ def detect_brand_column(columns: list[str]) -> str | None:
         ):
             return col_name
     return _column_from_candidates(columns, BRAND_FALLBACK_COLUMN_CANDIDATES)
+
+
+def detect_is_faulty_column(columns: list[str]) -> str | None:
+    """Optional pre-mark column: TRUE → creative starts with ✕ fault."""
+    return _column_from_candidates(columns, IS_FAULTY_COLUMN_CANDIDATES)
+
+
+def parse_is_faulty_value(value) -> bool:
+    """Return True only for explicit truthy spreadsheet values."""
+    if value is True:
+        return True
+    if value is False:
+        return False
+    if isinstance(value, (int, float)) and not pd.isna(value):
+        return value != 0
+    s = _cell_str(value).lower()
+    if not s:
+        return False
+    if s in ("true", "1", "1.0", "yes", "y", "t", "x", "✓", "fault", "faulty"):
+        return True
+    return False
 
 
 def detect_advertiser_name_column(columns: list[str]) -> str | None:

@@ -24,6 +24,8 @@ from metadata import (
     brand_column_error,
     detect_advertiser_name_column,
     detect_brand_column,
+    detect_is_faulty_column,
+    parse_is_faulty_value,
     prepare_upload_dataframe,
 )
 from media import (
@@ -425,7 +427,13 @@ def _make_row(
     meta_lookup: dict,
     thumb: Path | None,
     thumb_fetch_detail: str | None = None,
+    faulty_col: str | None = None,
 ) -> dict:
+    pre_fault = (
+        parse_is_faulty_value(df.iloc[idx][faulty_col])
+        if faulty_col
+        else False
+    )
     row = {
         "index": int(idx),
         "url": url,
@@ -433,11 +441,11 @@ def _make_row(
         "advertiserName": _advertiser_for_row(df, idx, adv_col),
         "thumb": str(thumb) if thumb else None,
         "metadata": row_metadata(df, idx, meta_lookup),
-        "isFault": False,
+        "isFault": pre_fault,
         "advertiserMatch": None,
         "reviewed": False,
         "needsIndividualReview": False,
-        "faultManual": False,
+        "faultManual": pre_fault,
     }
     if thumb_fetch_detail:
         row["thumbFetchDetail"] = thumb_fetch_detail
@@ -476,6 +484,7 @@ async def _download_rows(
         batch_progress,
     )
 
+    faulty_col = detect_is_faulty_column(list(df.columns))
     rows: list[dict] = []
     row_downloaded = 0
     for idx, url in enumerate(urls):
@@ -487,7 +496,15 @@ async def _download_rows(
         detail = fetch_failures.get(url) if url and not thumb else None
         rows.append(
             _make_row(
-                df, idx, url, brand_col, adv_col, meta_lookup, thumb, detail
+                df,
+                idx,
+                url,
+                brand_col,
+                adv_col,
+                meta_lookup,
+                thumb,
+                detail,
+                faulty_col,
             )
         )
         if on_progress:
@@ -648,6 +665,7 @@ async def _process_job(
             batch_progress,
         )
 
+        faulty_col = detect_is_faulty_column(list(df.columns))
         rows = []
         for idx, url in enumerate(urls):
             thumb = _validated_thumb(
@@ -656,7 +674,15 @@ async def _process_job(
             detail = fetch_failures.get(url) if url and not thumb else None
             rows.append(
                 _make_row(
-                    df, idx, url, brand_col, adv_col, meta_lookup, thumb, detail
+                    df,
+                    idx,
+                    url,
+                    brand_col,
+                    adv_col,
+                    meta_lookup,
+                    thumb,
+                    detail,
+                    faulty_col,
                 )
             )
 
@@ -821,6 +847,7 @@ async def upload_stream(
             df = await asyncio.to_thread(_load_dataframe, raw, filename)
             col, brand_col, adv_col = _resolve_columns(df, url_column)
             meta_lookup = column_lookup(df)
+            faulty_col = detect_is_faulty_column(list(df.columns))
             total = len(df)
 
             yield _stream_line(
@@ -915,6 +942,7 @@ async def upload_stream(
                         meta_lookup,
                         thumb,
                         detail,
+                        faulty_col,
                     )
                 )
 
