@@ -782,7 +782,83 @@ function formatBytes(n) {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-/** Poll job status — reliable progress (streaming often buffers in browsers). */
+/** Stream upload — real progress on Vercel (NDJSON). Falls back to job polling locally. */
+async function uploadWithStream(fd) {
+  showLoading(true);
+  setLoadingProgress(0, "starting", "Uploading file to server…", "");
+
+  try {
+    const res = await fetch("/api/upload-stream", { method: "POST", body: fd });
+    if (!res.ok) {
+      const err = await parseJsonResponse(res).catch(() => ({}));
+      throw new Error(err.detail || `Upload failed (${res.status})`);
+    }
+    if (!res.body) {
+      throw new Error("Streaming upload not supported by browser");
+    }
+
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    let result = null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const parts = buf.split("\n");
+      buf = parts.pop() || "";
+      for (const line of parts) {
+        if (!line.trim()) continue;
+        let msg;
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (msg.type === "error") {
+          throw new Error(msg.detail || "Processing failed");
+        }
+        const count =
+          msg.total > 0
+            ? `Row ${msg.current ?? 0} / ${msg.total} · ${msg.downloaded ?? 0} thumbnails`
+            : "";
+        if (msg.percent != null || msg.phase) {
+          let pct = Number(msg.percent ?? 0);
+          pct = Math.max(pct, 15);
+          setLoadingProgress(pct, msg.phase || "download", msg.hint, count);
+        }
+        if (msg.type === "complete" || msg.sessionId) {
+          result = msg;
+        }
+      }
+    }
+    if (buf.trim()) {
+      const msg = JSON.parse(buf);
+      if (msg.type === "error") throw new Error(msg.detail || "Processing failed");
+      if (msg.sessionId) result = msg;
+    }
+    if (!result?.sessionId) {
+      throw new Error("Upload finished without session data");
+    }
+    setLoadingProgress(100, "done", "Starting review…", "");
+    await sleep(300);
+    return result;
+  } finally {
+    showLoading(false);
+  }
+}
+
+async function uploadFile(fd) {
+  try {
+    return await uploadWithStream(fd);
+  } catch (err) {
+    console.warn("Stream upload failed, falling back to job polling:", err);
+    return uploadWithPolling(fd);
+  }
+}
+
+/** Poll job status — fallback when streaming is unavailable. */
 async function uploadWithPolling(fd) {
   showLoading(true);
   setLoadingProgress(0, "starting", "Uploading file to server…", "");
@@ -976,7 +1052,30 @@ function exportResults() {
     setStatus("Export is available after review completes.");
     return;
   }
-  window.location.href = `/api/session/${sessionId}/export`;
+  (async () => {
+    try {
+      const res = await fetch(`/api/session/${sessionId}/export`);
+      if (!res.ok) {
+        const err = await parseJsonResponse(res).catch(() => ({}));
+        throw new Error(err.detail || `Export failed (${res.status})`);
+      }
+      const blob = await res.blob();
+      if (!blob.size) {
+        throw new Error("Export returned an empty file");
+      }
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "media_inspector_output.xlsx";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      setStatus("Download started.");
+    } catch (err) {
+      setStatus(err.message || String(err));
+    }
+  })();
 }
 
 document.addEventListener("keydown", (e) => {
@@ -1125,7 +1224,7 @@ $("upload-form").addEventListener("submit", async (e) => {
   fd.append("k_groups", "0");
 
   try {
-    const data = await uploadWithPolling(fd);
+    const data = await uploadFile(fd);
 
     sessionId = data.sessionId;
     brandGroups = data.groups || [];

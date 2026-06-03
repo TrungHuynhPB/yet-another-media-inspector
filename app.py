@@ -203,37 +203,197 @@ _sessions: dict[str, dict] = {}
 _jobs: dict[str, dict] = {}
 
 
-def _faults_path(session_id: str) -> Path:
-    return SESSIONS_DIR / f"{session_id}.faults.json"
+def _review_path(session_id: str) -> Path:
+    return SESSIONS_DIR / f"{session_id}.review.json"
 
 
-def _faults_snapshot(sess: dict) -> dict:
+def _export_checkpoint_path(session_id: str) -> Path:
+    return _session_dir(session_id) / "export_checkpoint.xlsx"
+
+
+def _review_snapshot(sess: dict) -> dict:
     return {
-        "faults": {
+        "url_column": sess.get("url_column"),
+        "brand_column": sess.get("brand_column"),
+        "adv_column": sess.get("adv_column"),
+        "rows": {
             str(r["index"]): {
                 "isFault": bool(r.get("isFault")),
                 "faultManual": bool(r.get("faultManual")),
+                "advertiserMatch": r.get("advertiserMatch"),
+                "reviewed": bool(r.get("reviewed")),
+                "brandName": r.get("brandName", ""),
+                "advertiserName": r.get("advertiserName", ""),
             }
             for r in sess.get("rows", [])
-        }
+        },
     }
 
 
-def _merge_faults_snapshot(sess: dict, snapshot: dict) -> None:
-    faults = snapshot.get("faults") or {}
+def _merge_review_snapshot(sess: dict, snapshot: dict) -> None:
+    rows = snapshot.get("rows") or snapshot.get("faults") or {}
     for row in sess.get("rows", []):
-        state = faults.get(str(row["index"]))
+        state = rows.get(str(row["index"]))
         if state is None:
             continue
         row["isFault"] = bool(state.get("isFault"))
         row["faultManual"] = bool(state.get("faultManual"))
+        if "advertiserMatch" in state:
+            row["advertiserMatch"] = state.get("advertiserMatch")
+        if "reviewed" in state:
+            row["reviewed"] = bool(state.get("reviewed"))
+        if state.get("brandName"):
+            row["brandName"] = state["brandName"]
+        if state.get("advertiserName"):
+            row["advertiserName"] = state["advertiserName"]
 
 
-def _write_faults_snapshot(session_id: str, sess: dict) -> None:
+def _write_review_snapshot(session_id: str, sess: dict) -> None:
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(_faults_snapshot(sess)).encode("utf-8")
-    _faults_path(session_id).write_bytes(payload)
-    _blob_put_bytes(f"sessions/{session_id}.faults.json", payload, content_type="application/json")
+    payload = json.dumps(_review_snapshot(sess)).encode("utf-8")
+    _review_path(session_id).write_bytes(payload)
+    _blob_put_bytes(
+        f"sessions/{session_id}.review.json", payload, content_type="application/json"
+    )
+
+
+def _load_review_snapshot(session_id: str) -> dict | None:
+    path = _review_path(session_id)
+    if not path.is_file() and _blob_enabled():
+        data = _blob_get_bytes(f"sessions/{session_id}.review.json", timeout=20.0)
+        if data:
+            _ensure_data_dirs()
+            path.write_bytes(data)
+    if path.is_file():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Failed to read review snapshot %s: %s", session_id, exc)
+    # Legacy faults-only snapshot
+    legacy = SESSIONS_DIR / f"{session_id}.faults.json"
+    if not legacy.is_file() and _blob_enabled():
+        data = _blob_get_bytes(f"sessions/{session_id}.faults.json", timeout=15.0)
+        if data:
+            _ensure_data_dirs()
+            legacy.write_bytes(data)
+    if legacy.is_file():
+        try:
+            return json.loads(legacy.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return None
+
+
+def _source_blob_paths(session_id: str, ext: str) -> str:
+    return f"sessions/{session_id}/source{ext}"
+
+
+def _persist_upload_source(session_id: str, raw: bytes, filename: str) -> None:
+    ext = Path(filename or "upload.xlsx").suffix.lower() or ".xlsx"
+    if ext not in (".xlsx", ".xls", ".csv", ".json"):
+        ext = ".xlsx"
+    out_dir = _session_dir(session_id)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"source{ext}"
+    path.write_bytes(raw)
+    _blob_put_bytes(
+        _source_blob_paths(session_id, ext),
+        raw,
+        content_type="application/octet-stream",
+    )
+
+
+def _load_source_bytes(session_id: str) -> tuple[bytes, str] | None:
+    for ext in (".xlsx", ".xls", ".csv", ".json"):
+        path = _session_dir(session_id) / f"source{ext}"
+        if path.is_file():
+            return path.read_bytes(), f"source{ext}"
+        if _blob_enabled():
+            data = _blob_get_bytes(_source_blob_paths(session_id, ext), timeout=30.0)
+            if data:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+                return data, f"source{ext}"
+    return None
+
+
+def _build_export_dataframe(sess: dict) -> pd.DataFrame:
+    df = sess["df"].copy()
+    rows_by_idx = {int(r["index"]): r for r in sess["rows"]}
+    df["BRAND"] = [rows_by_idx.get(i, {}).get("brandName", "") for i in range(len(df))]
+    df["ADVERTISER_NAME"] = [
+        rows_by_idx.get(i, {}).get("advertiserName", "") for i in range(len(df))
+    ]
+    df["isFault"] = [rows_by_idx.get(i, {}).get("isFault", False) for i in range(len(df))]
+    df["advertiserMatch"] = [rows_by_idx.get(i, {}).get("advertiserMatch") for i in range(len(df))]
+    df["reviewed"] = [rows_by_idx.get(i, {}).get("reviewed", False) for i in range(len(df))]
+    return df
+
+
+def _build_export_bytes(sess: dict) -> bytes:
+    buf = BytesIO()
+    _build_export_dataframe(sess).to_excel(buf, index=False)
+    return buf.getvalue()
+
+
+def _build_export_from_artifacts(session_id: str) -> bytes | None:
+    """Rebuild export when session pickle is missing but source + review snapshot exist."""
+    source = _load_source_bytes(session_id)
+    review = _load_review_snapshot(session_id)
+    if not source or not review:
+        return None
+    raw, name = source
+    df = _load_dataframe(raw, name)
+    rows = review.get("rows") or {}
+    brand_names = [rows.get(str(i), {}).get("brandName", "") for i in range(len(df))]
+    adv_names = [rows.get(str(i), {}).get("advertiserName", "") for i in range(len(df))]
+    df["BRAND"] = brand_names
+    df["ADVERTISER_NAME"] = adv_names
+    df["isFault"] = [bool(rows.get(str(i), {}).get("isFault", False)) for i in range(len(df))]
+    df["advertiserMatch"] = [rows.get(str(i), {}).get("advertiserMatch") for i in range(len(df))]
+    df["reviewed"] = [bool(rows.get(str(i), {}).get("reviewed", False)) for i in range(len(df))]
+    buf = BytesIO()
+    df.to_excel(buf, index=False)
+    return buf.getvalue()
+
+
+def _checkpoint_export(session_id: str, sess: dict) -> None:
+    try:
+        data = _build_export_bytes(sess)
+        path = _export_checkpoint_path(session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        _blob_put_bytes(
+            f"sessions/{session_id}/export.xlsx",
+            data,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except Exception as exc:
+        logger.warning("Export checkpoint failed for %s: %s", session_id, exc)
+
+
+def _load_export_checkpoint(session_id: str) -> bytes | None:
+    path = _export_checkpoint_path(session_id)
+    if path.is_file() and path.stat().st_size > 0:
+        return path.read_bytes()
+    if _blob_enabled():
+        data = _blob_get_bytes(
+            f"sessions/{session_id}/export.xlsx",
+            timeout=30.0,
+        )
+        if data:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            return data
+    return None
+
+
+def _export_file_response(data: bytes, filename: str = "media_inspector_output.xlsx"):
+    return StreamingResponse(
+        BytesIO(data),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 def _session_get(session_id: str) -> dict | None:
@@ -261,23 +421,23 @@ def _session_get(session_id: str) -> dict | None:
             return None
 
     if _is_serverless():
-        fp = _faults_path(session_id)
-        if not fp.is_file() and _blob_enabled():
-            data = _blob_get_bytes(f"sessions/{session_id}.faults.json", timeout=15.0)
-            if data:
-                _ensure_data_dirs()
-                fp.write_bytes(data)
-        if fp.is_file():
+        snapshot = _load_review_snapshot(session_id)
+        if snapshot:
             try:
-                _merge_faults_snapshot(sess, json.loads(fp.read_text(encoding="utf-8")))
+                _merge_review_snapshot(sess, snapshot)
             except Exception as exc:
-                logger.warning("Failed to merge faults for %s: %s", session_id, exc)
+                logger.warning("Failed to merge review snapshot for %s: %s", session_id, exc)
     return sess
 
 
 def _session_put(session_id: str, sess: dict, *, full: bool = True) -> None:
     _sessions[session_id] = sess
     if not _is_serverless():
+        if full:
+            try:
+                _checkpoint_export(session_id, sess)
+            except Exception:
+                pass
         return
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     if full:
@@ -285,7 +445,9 @@ def _session_put(session_id: str, sess: dict, *, full: bool = True) -> None:
         data = pickle.dumps(sess, protocol=pickle.HIGHEST_PROTOCOL)
         path.write_bytes(data)
         _blob_put_bytes(f"sessions/{session_id}.pkl", data, content_type="application/octet-stream")
-    _write_faults_snapshot(session_id, sess)
+    _write_review_snapshot(session_id, sess)
+    if full:
+        _checkpoint_export(session_id, sess)
 
 
 def _job_get(job_id: str) -> dict | None:
@@ -652,6 +814,7 @@ async def _process_job(
             _job_update(
                 job_id,
                 current=done,
+                total=total,
                 percent=min(pct, 90),
                 hint=f"Fetched {done} of {unique_total} unique URLs… {next_hint()}",
                 downloaded=dl,
@@ -685,6 +848,16 @@ async def _process_job(
                     faulty_col,
                 )
             )
+            if idx % 5 == 0 or idx + 1 == total:
+                pct = 90 + int(((idx + 1) / max(total, 1)) * 4)
+                _job_update(
+                    job_id,
+                    current=idx + 1,
+                    total=total,
+                    percent=min(pct, 94),
+                    phase="download",
+                    downloaded=sum(1 for r in rows if r.get("thumb")),
+                )
 
         _job_update(
             job_id,
@@ -727,6 +900,7 @@ async def create_job(
         meta_lookup = column_lookup(df)
 
         job_id = str(uuid.uuid4())
+        _persist_upload_source(job_id, raw, file.filename or "")
         cache_dir = _session_dir(job_id) / "cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -850,19 +1024,8 @@ async def upload_stream(
             faulty_col = detect_is_faulty_column(list(df.columns))
             total = len(df)
 
-            yield _stream_line(
-                {
-                    "type": "progress",
-                    "phase": "download",
-                    "current": 0,
-                    "total": total,
-                    "hint": "Downloading creatives (images & Adclarity/TikTok video posters)…",
-                    "percent": 5,
-                }
-            )
-            await asyncio.sleep(0)
-
             session_id = str(uuid.uuid4())
+            _persist_upload_source(session_id, raw, filename)
             cache_dir = _session_dir(session_id) / "cache"
             cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -920,7 +1083,7 @@ async def upload_stream(
                         "status": "working",
                     }
                 )
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(0.25)
 
             thumb_by_url, fetch_failures = batch_task.result()
             rows = []
@@ -945,6 +1108,21 @@ async def upload_stream(
                         faulty_col,
                     )
                 )
+                if idx % 5 == 0 or idx + 1 == total:
+                    pct = 90 + int(((idx + 1) / max(total, 1)) * 4)
+                    yield _stream_line(
+                        {
+                            "type": "progress",
+                            "phase": "download",
+                            "current": idx + 1,
+                            "total": total,
+                            "downloaded": downloaded,
+                            "hint": f"Building rows {idx + 1} / {total}…",
+                            "percent": min(pct, 94),
+                            "status": "working",
+                        }
+                    )
+                    await asyncio.sleep(0)
 
             yield _stream_line(
                 {
@@ -1019,6 +1197,7 @@ async def _process_upload(file: UploadFile, url_column: str):
     col, brand_col, adv_col = _resolve_columns(df, url_column)
     meta_lookup = column_lookup(df)
     session_id = str(uuid.uuid4())
+    _persist_upload_source(session_id, raw, file.filename or "")
     cache_dir = _session_dir(session_id) / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     rows = await _download_rows(df, col, brand_col, adv_col, cache_dir, meta_lookup)
@@ -1213,32 +1392,27 @@ async def review_item(session_id: str, body: dict):
 
 @app.get("/api/session/{session_id}/export")
 async def export_xlsx(session_id: str):
+    checkpoint = await asyncio.to_thread(_load_export_checkpoint, session_id)
     sess = _session_get(session_id)
+
+    if sess:
+        try:
+            data = await asyncio.to_thread(_build_export_bytes, sess)
+            await asyncio.to_thread(_checkpoint_export, session_id, sess)
+            return _export_file_response(data)
+        except Exception as exc:
+            logger.exception("Export from session failed %s: %s", session_id, exc)
+
+    if checkpoint:
+        return _export_file_response(checkpoint)
+
+    data = await asyncio.to_thread(_build_export_from_artifacts, session_id)
+    if data:
+        return _export_file_response(data)
+
     if not sess:
-        raise HTTPException(404, "Session not found")
-
-    df = sess["df"].copy()
-    rows_by_idx = {int(r["index"]): r for r in sess["rows"]}
-    fault_map = {r["index"]: r["isFault"] for r in sess["rows"]}
-    match_map = {r["index"]: r.get("advertiserMatch") for r in sess["rows"]}
-    reviewed_map = {r["index"]: r["reviewed"] for r in sess["rows"]}
-
-    df["BRAND"] = [
-        rows_by_idx.get(i, {}).get("brandName", "") for i in range(len(df))
-    ]
-    df["ADVERTISER_NAME"] = [
-        rows_by_idx.get(i, {}).get("advertiserName", "") for i in range(len(df))
-    ]
-    df["isFault"] = [fault_map.get(i, False) for i in range(len(df))]
-    df["advertiserMatch"] = [match_map.get(i) for i in range(len(df))]
-    df["reviewed"] = [reviewed_map.get(i, False) for i in range(len(df))]
-
-    out_dir = _session_dir(session_id)
-    out_path = out_dir / "media_inspector_output.xlsx"
-    df.to_excel(out_path, index=False)
-
-    return FileResponse(
-        out_path,
-        filename="media_inspector_output.xlsx",
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+        raise HTTPException(
+            404,
+            "Session not found. Your work may still be recoverable if you retry shortly.",
+        )
+    raise HTTPException(500, "Export failed — please try again.")
