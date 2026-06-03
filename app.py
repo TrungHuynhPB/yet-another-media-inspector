@@ -22,9 +22,11 @@ from hints_loader import hint_rotate_ms, load_hints
 from metadata import column_lookup, row_metadata
 from metadata import (
     brand_column_error,
+    classified_export_filename,
     detect_advertiser_name_column,
     detect_brand_column,
     detect_is_faulty_column,
+    is_faulty_export_column,
     parse_is_faulty_value,
     prepare_upload_dataframe,
 )
@@ -301,6 +303,34 @@ def _persist_upload_source(session_id: str, raw: bytes, filename: str) -> None:
         raw,
         content_type="application/octet-stream",
     )
+    meta = json.dumps({"filename": filename or "upload.xlsx"}).encode("utf-8")
+    (out_dir / "source_meta.json").write_bytes(meta)
+    _blob_put_bytes(
+        f"sessions/{session_id}/source_meta.json",
+        meta,
+        content_type="application/json",
+    )
+
+
+def _load_source_filename(session_id: str, sess: dict | None = None) -> str:
+    if sess and sess.get("sourceFilename"):
+        return str(sess["sourceFilename"])
+    path = _session_dir(session_id) / "source_meta.json"
+    if not path.is_file() and _blob_enabled():
+        data = _blob_get_bytes(f"sessions/{session_id}/source_meta.json", timeout=10.0)
+        if data:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+    if path.is_file():
+        try:
+            return json.loads(path.read_text(encoding="utf-8")).get("filename") or ""
+        except Exception:
+            pass
+    return ""
+
+
+def _export_download_name(session_id: str, sess: dict | None = None) -> str:
+    return classified_export_filename(_load_source_filename(session_id, sess))
 
 
 def _load_source_bytes(session_id: str) -> tuple[bytes, str] | None:
@@ -324,7 +354,17 @@ def _build_export_dataframe(sess: dict) -> pd.DataFrame:
     df["ADVERTISER_NAME"] = [
         rows_by_idx.get(i, {}).get("advertiserName", "") for i in range(len(df))
     ]
-    df["isFault"] = [rows_by_idx.get(i, {}).get("isFault", False) for i in range(len(df))]
+    faulty_values = [
+        bool(rows_by_idx.get(i, {}).get("isFault", False)) for i in range(len(df))
+    ]
+    faulty_col = is_faulty_export_column(list(df.columns))
+    if faulty_col:
+        df[faulty_col] = faulty_values
+    else:
+        df["isFaulty"] = faulty_values
+    drop_legacy = [c for c in df.columns if str(c).strip().lower() == "isfault"]
+    if drop_legacy:
+        df = df.drop(columns=drop_legacy)
     df["advertiserMatch"] = [rows_by_idx.get(i, {}).get("advertiserMatch") for i in range(len(df))]
     df["reviewed"] = [rows_by_idx.get(i, {}).get("reviewed", False) for i in range(len(df))]
     return df
@@ -349,7 +389,17 @@ def _build_export_from_artifacts(session_id: str) -> bytes | None:
     adv_names = [rows.get(str(i), {}).get("advertiserName", "") for i in range(len(df))]
     df["BRAND"] = brand_names
     df["ADVERTISER_NAME"] = adv_names
-    df["isFault"] = [bool(rows.get(str(i), {}).get("isFault", False)) for i in range(len(df))]
+    faulty_values = [
+        bool(rows.get(str(i), {}).get("isFault", False)) for i in range(len(df))
+    ]
+    faulty_col = is_faulty_export_column(list(df.columns))
+    if faulty_col:
+        df[faulty_col] = faulty_values
+    else:
+        df["isFaulty"] = faulty_values
+    drop_legacy = [c for c in df.columns if str(c).strip().lower() == "isfault"]
+    if drop_legacy:
+        df = df.drop(columns=drop_legacy)
     df["advertiserMatch"] = [rows.get(str(i), {}).get("advertiserMatch") for i in range(len(df))]
     df["reviewed"] = [bool(rows.get(str(i), {}).get("reviewed", False)) for i in range(len(df))]
     buf = BytesIO()
@@ -683,6 +733,7 @@ def _finalize_session(
     brand_col: str,
     adv_col: str | None,
     rows: list[dict],
+    source_filename: str = "",
 ) -> dict:
     with_url = [r for r in rows if r.get("url")]
     if not with_url:
@@ -704,6 +755,7 @@ def _finalize_session(
             "url_column": col,
             "brand_column": brand_col,
             "adv_column": adv_col,
+            "sourceFilename": source_filename or _load_source_filename(session_id),
             "rows": rows,
             "groups": group_list,
             "uncertain": uncertain_list,
@@ -867,7 +919,15 @@ async def _process_job(
             current=total,
         )
 
-        result = _finalize_session(job_id, df, col, brand_col, adv_col, rows)
+        result = _finalize_session(
+            job_id,
+            df,
+            col,
+            brand_col,
+            adv_col,
+            rows,
+            _load_source_filename(job_id),
+        )
         _job_update(
             job_id,
             status="complete",
@@ -1150,7 +1210,9 @@ async def upload_stream(
             )
             await asyncio.sleep(0)
 
-            payload = _finalize_session(session_id, df, col, brand_col, adv_col, rows)
+            payload = _finalize_session(
+                session_id, df, col, brand_col, adv_col, rows, filename
+            )
             payload["type"] = "complete"
             payload["percent"] = 100
             yield _stream_line(payload)
@@ -1201,7 +1263,15 @@ async def _process_upload(file: UploadFile, url_column: str):
     cache_dir = _session_dir(session_id) / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     rows = await _download_rows(df, col, brand_col, adv_col, cache_dir, meta_lookup)
-    return _finalize_session(session_id, df, col, brand_col, adv_col, rows)
+    return _finalize_session(
+        session_id,
+        df,
+        col,
+        brand_col,
+        adv_col,
+        rows,
+        file.filename or "",
+    )
 
 
 @app.get("/api/thumb/{session_id}/{filename}")
@@ -1392,23 +1462,24 @@ async def review_item(session_id: str, body: dict):
 
 @app.get("/api/session/{session_id}/export")
 async def export_xlsx(session_id: str):
-    checkpoint = await asyncio.to_thread(_load_export_checkpoint, session_id)
     sess = _session_get(session_id)
+    download_name = _export_download_name(session_id, sess)
+    checkpoint = await asyncio.to_thread(_load_export_checkpoint, session_id)
 
     if sess:
         try:
             data = await asyncio.to_thread(_build_export_bytes, sess)
             await asyncio.to_thread(_checkpoint_export, session_id, sess)
-            return _export_file_response(data)
+            return _export_file_response(data, download_name)
         except Exception as exc:
             logger.exception("Export from session failed %s: %s", session_id, exc)
 
     if checkpoint:
-        return _export_file_response(checkpoint)
+        return _export_file_response(checkpoint, download_name)
 
     data = await asyncio.to_thread(_build_export_from_artifacts, session_id)
     if data:
-        return _export_file_response(data)
+        return _export_file_response(data, download_name)
 
     if not sess:
         raise HTTPException(

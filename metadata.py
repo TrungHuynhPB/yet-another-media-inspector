@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 
 # Primary group title — BRAND / brand
@@ -137,6 +139,25 @@ def detect_brand_column(columns: list[str]) -> str | None:
 def detect_is_faulty_column(columns: list[str]) -> str | None:
     """Optional pre-mark column: TRUE → creative starts with ✕ fault."""
     return _column_from_candidates(columns, IS_FAULTY_COLUMN_CANDIDATES)
+
+
+def is_faulty_export_column(columns: list[str]) -> str | None:
+    """Existing isFaulty column to overwrite on export (not legacy isFault)."""
+    lower = {str(c).strip().lower(): c for c in columns}
+    for key in ("isfaulty", "is_faulty"):
+        if key in lower:
+            return lower[key]
+    return None
+
+
+def classified_export_filename(original_filename: str) -> str:
+    """e.g. UL_VN_Deodorant_FPK_May26.xlsx → UL_VN_Deodorant_FPK_May26_Classified.xlsx"""
+    p = Path((original_filename or "upload.xlsx").strip())
+    stem = p.stem or "upload"
+    ext = p.suffix if p.suffix else ".xlsx"
+    if stem.endswith("_Classified"):
+        return f"{stem}{ext}"
+    return f"{stem}_Classified{ext}"
 
 
 def parse_is_faulty_value(value) -> bool:

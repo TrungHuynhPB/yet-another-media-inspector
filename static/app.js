@@ -1063,10 +1063,14 @@ function exportResults() {
       if (!blob.size) {
         throw new Error("Export returned an empty file");
       }
+      let filename = "media_inspector_output.xlsx";
+      const disp = res.headers.get("Content-Disposition") || "";
+      const m = /filename="?([^";\n]+)"?/i.exec(disp);
+      if (m) filename = m[1].trim();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = "media_inspector_output.xlsx";
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       a.remove();
