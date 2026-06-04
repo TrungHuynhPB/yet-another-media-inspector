@@ -10,6 +10,40 @@ let uploadedFilename = "";
 
 const RING_CIRCUMFERENCE = 2 * Math.PI * 52;
 
+/** Vercel serverless body limit (~4.5 MB); leave headroom for multipart encoding. */
+const MAX_UPLOAD_BYTES = 4.5 * 1024 * 1024;
+const CLIENT_MAX_UPLOAD_BYTES = 4 * 1024 * 1024;
+
+function uploadTooLargeMessage(sizeBytes) {
+  const fileMb = (sizeBytes / (1024 * 1024)).toFixed(1);
+  return (
+    `File is ${fileMb} MB — this deployment accepts about 4.5 MB per upload (Vercel limit). ` +
+    "Save a smaller Excel/CSV (drop unused columns), or split into multiple files."
+  );
+}
+
+function httpErrorMessage(status) {
+  if (status === 413) {
+    return uploadTooLargeMessage(MAX_UPLOAD_BYTES);
+  }
+  if (status >= 500) {
+    return `Server error (${status}). Try again in a moment.`;
+  }
+  return `Request failed (${status}).`;
+}
+
+function isNonRetryableUploadStatus(status) {
+  return status === 413 || status === 400 || status === 401 || status === 403 || status === 405;
+}
+
+function validateUploadFile(file) {
+  if (!file) return "Choose a file first.";
+  if (file.size > CLIENT_MAX_UPLOAD_BYTES) {
+    return uploadTooLargeMessage(file.size);
+  }
+  return null;
+}
+
 const META_LABELS = {
   brand: "Brand",
   advertiser_name: "Advertiser",
@@ -860,8 +894,16 @@ async function uploadWithStream(fd) {
   try {
     const res = await fetch("/api/upload-stream", { method: "POST", body: fd });
     if (!res.ok) {
-      const err = await parseJsonResponse(res).catch(() => ({}));
-      throw new Error(err.detail || `Upload failed (${res.status})`);
+      let detail = httpErrorMessage(res.status);
+      try {
+        const err = await parseJsonResponse(res);
+        detail = err.detail || detail;
+      } catch (e) {
+        if (e.uploadStatus) throw e;
+      }
+      const err = new Error(typeof detail === "string" ? detail : String(detail));
+      err.uploadStatus = res.status;
+      throw err;
     }
     if (!res.body) {
       throw new Error("Streaming upload not supported by browser");
@@ -923,6 +965,9 @@ async function uploadFile(fd) {
   try {
     return await uploadWithStream(fd);
   } catch (err) {
+    if (err.uploadStatus && isNonRetryableUploadStatus(err.uploadStatus)) {
+      throw err;
+    }
     console.warn("Stream upload failed, falling back to job polling:", err);
     return uploadWithPolling(fd);
   }
@@ -942,11 +987,19 @@ async function uploadWithPolling(fd) {
     start = JSON.parse(uploadRes.text || "");
   } catch {
     showLoading(false);
-    throw new Error(`Invalid server response (${uploadRes.status})`);
+    const err = new Error(httpErrorMessage(uploadRes.status));
+    err.uploadStatus = uploadRes.status;
+    throw err;
   }
   if (!uploadRes.ok) {
     showLoading(false);
-    throw new Error(start.detail || "Upload failed");
+    const err = new Error(
+      uploadRes.status === 413
+        ? uploadTooLargeMessage(MAX_UPLOAD_BYTES)
+        : start.detail || httpErrorMessage(uploadRes.status)
+    );
+    err.uploadStatus = uploadRes.status;
+    throw err;
   }
 
   const hints = start.hints?.length ? start.hints : [];
@@ -1057,13 +1110,19 @@ async function parseJsonResponse(res) {
     throw new Error(
       res.ok
         ? "Empty response from server"
-        : `Server error (${res.status}). The server may have restarted during upload — try again.`
+        : res.status === 413
+          ? uploadTooLargeMessage(MAX_UPLOAD_BYTES)
+          : `Server error (${res.status}). The server may have restarted during upload — try again.`
     );
   }
   try {
     return JSON.parse(text);
   } catch {
-    throw new Error(`Invalid server response (${res.status})`);
+    const err = new Error(
+      res.status === 413 ? uploadTooLargeMessage(MAX_UPLOAD_BYTES) : httpErrorMessage(res.status)
+    );
+    err.uploadStatus = res.status;
+    throw err;
   }
 }
 
@@ -1284,6 +1343,12 @@ $("upload-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const fileInput = $("file-input");
   if (!fileInput.files.length) return;
+
+  const sizeErr = validateUploadFile(fileInput.files[0]);
+  if (sizeErr) {
+    setStatus(sizeErr);
+    return;
+  }
 
   const btn = $("upload-btn");
   btn.disabled = true;

@@ -70,6 +70,25 @@ _VERCEL_BLOB_API_BASE_URL = "https://blob.vercel-storage.com"
 _BLOB_API_VERSION = "10"
 _blob_index: dict[str, dict] = {}
 
+# Vercel serverless rejects request bodies above ~4.5 MB (413) before the app runs.
+VERCEL_MAX_UPLOAD_BYTES = 4_500_000
+MAX_UPLOAD_BYTES = int(
+    os.environ.get("YAMI_MAX_UPLOAD_BYTES", str(VERCEL_MAX_UPLOAD_BYTES))
+)
+
+
+def _upload_too_large_detail(size: int) -> str:
+    mb = VERCEL_MAX_UPLOAD_BYTES / (1024 * 1024)
+    return (
+        f"Upload is {size / (1024 * 1024):.1f} MB — max about {mb:.1f} MB on Vercel. "
+        "Remove unused columns, save a smaller Excel/CSV, or split the file."
+    )
+
+
+def _reject_oversized_upload(raw: bytes) -> None:
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, _upload_too_large_detail(len(raw)))
+
 
 def _blob_enabled() -> bool:
     # Uses the Blob REST API directly (no SDK dependency).
@@ -801,6 +820,8 @@ async def get_diagnostics():
     info["blobEnabled"] = _blob_enabled()
     info["blobTokenPresent"] = bool(os.environ.get("BLOB_READ_WRITE_TOKEN"))
     info["blobLibAvailable"] = True
+    info["maxUploadBytes"] = MAX_UPLOAD_BYTES
+    info["vercelPayloadLimit"] = _is_serverless()
     return info
 
 
@@ -955,6 +976,7 @@ async def create_job(
     try:
         _ensure_data_dirs()
         raw = await file.read()
+        _reject_oversized_upload(raw)
         df = await asyncio.to_thread(_load_dataframe, raw, file.filename or "")
         col, brand_col, adv_col = _resolve_columns(df, url_column)
         meta_lookup = column_lookup(df)
@@ -1066,6 +1088,7 @@ async def upload_stream(
             await asyncio.sleep(0)
 
             raw = await file.read()
+            _reject_oversized_upload(raw)
             yield _stream_line(
                 {
                     "type": "progress",

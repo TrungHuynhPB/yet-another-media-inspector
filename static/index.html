@@ -26,6 +26,10 @@
         <strong>Heads up:</strong> Ad blockers / privacy extensions can block media previews (AdClarity, TikTok, YouTube).
         If thumbnails look unavailable, try disabling your blocker for this site, then refresh and re-upload.
       </div>
+      <div class="notice notice-info" role="note" aria-label="Upload size limit">
+        <strong>File size:</strong> On Vercel, uploads must stay under about <strong>4.5&nbsp;MB</strong>.
+        Large Excel files often exceed that — remove unused columns or export CSV before uploading.
+      </div>
       <form id="upload-form">
         <label class="file-label">
           <input type="file" id="file-input" accept=".xlsx,.xls,.csv,.json,text/csv" required />
@@ -150,6 +154,6 @@
       </div>
     </div>
   </div>
-  <script src="/static/app.js?v=24"></script>
+  <script src="/static/app.js?v=25"></script>
 </body>
 </html>

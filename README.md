@@ -21,7 +21,11 @@ Requirement:
 
 Status:
 + works well with ad-clarity urls, for tiktok & youtube still have some issues on fetching media
-+ works with 5000 rows or less 
++ works with 5000 rows or less when running locally; **Vercel deploys limit each upload to ~4.5 MB** (HTTP 413 if larger)
+
+### Upload size on Vercel
+
+Serverless functions cannot accept request bodies larger than **4.5 MB**. That limit is enforced by Vercel before your file reaches the app — not something you can raise in `vercel.json`. If testers see **413** or “file too large”, have them shrink the spreadsheet (drop unused columns, save as `.csv`, or split the dataset). Local `python main.py` has no such cap unless you set `YAMI_MAX_UPLOAD_BYTES`.
 
 ## Setup
 
