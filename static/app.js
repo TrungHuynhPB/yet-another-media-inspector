@@ -236,6 +236,96 @@ function isGridReviewMode() {
   return mode === "uncertain" || mode === "brand";
 }
 
+const GRID_BATCH_SIZE = 48;
+let gridAllItems = [];
+let gridLoadObserver = null;
+
+function disconnectGridInfiniteScroll() {
+  if (gridLoadObserver) {
+    gridLoadObserver.disconnect();
+    gridLoadObserver = null;
+  }
+}
+
+function createThumbCell(item) {
+  const cell = document.createElement("button");
+  cell.type = "button";
+  cell.className = "thumb-cell";
+  cell.dataset.rowIndex = String(item.rowIndex);
+
+  const img = document.createElement("img");
+  img.alt = "Creative";
+  img.loading = "lazy";
+  img.draggable = false;
+  img.referrerPolicy = "no-referrer";
+  const mediaUrl = item.mediaUrl || item.thumbUrl;
+  const thumbUrl = item.thumbUrl;
+  const derivedPoster =
+    isVideoUrl(mediaUrl) && isAdclarityUrl(mediaUrl)
+      ? adclarityPosterFromMp4(mediaUrl)
+      : "";
+  const ytThumbs = isYoutubeUrl(mediaUrl) ? youtubeThumbCandidates(mediaUrl) : [];
+  setImgSrcWithFallback(img, [
+    thumbUrl,
+    derivedPoster,
+    derivedPoster ? adclarityJpgFromJpeg(derivedPoster) : "",
+    ...ytThumbs,
+    mediaUrl,
+  ]);
+
+  const overlay = document.createElement("div");
+  overlay.className = "fault-overlay";
+  overlay.innerHTML = '<span class="fault-x" aria-hidden="true">✕</span>';
+
+  cell.appendChild(img);
+  cell.appendChild(overlay);
+  cell._item = item;
+  applyFaultUi(item, cell, Boolean(item.isFault));
+  return cell;
+}
+
+function appendGridBatch(container) {
+  const sentinel = container.querySelector(".grid-scroll-sentinel");
+  if (!sentinel) return;
+
+  const rendered = parseInt(container.dataset.renderedCount || "0", 10);
+  if (rendered >= gridAllItems.length) return;
+
+  const batch = gridAllItems.slice(rendered, rendered + GRID_BATCH_SIZE);
+  for (const item of batch) {
+    container.insertBefore(createThumbCell(item), sentinel);
+  }
+
+  const nextCount = rendered + batch.length;
+  container.dataset.renderedCount = String(nextCount);
+
+  if (nextCount >= gridAllItems.length) {
+    sentinel.textContent = "";
+    sentinel.classList.add("grid-scroll-done");
+  } else {
+    sentinel.textContent = `Scroll for more… (${nextCount} of ${gridAllItems.length} shown)`;
+    sentinel.classList.remove("grid-scroll-done");
+  }
+}
+
+function bindGridInfiniteScroll(container) {
+  disconnectGridInfiniteScroll();
+  const sentinel = container.querySelector(".grid-scroll-sentinel");
+  if (!sentinel || gridAllItems.length <= GRID_BATCH_SIZE) {
+    if (sentinel) sentinel.classList.add("grid-scroll-done");
+    return;
+  }
+
+  gridLoadObserver = new IntersectionObserver(
+    (entries) => {
+      if (!entries[0]?.isIntersecting) return;
+      appendGridBatch(container);
+    },
+    { root: container, rootMargin: "240px", threshold: 0 }
+  );
+  gridLoadObserver.observe(sentinel);
+}
+
 function bindGridInteractions() {
   if (!cardGrid || cardGrid.dataset.bound === "1") return;
   cardGrid.dataset.bound = "1";
@@ -268,43 +358,21 @@ function bindGridInteractions() {
 }
 
 function renderBrandGrid(container, items) {
+  disconnectGridInfiniteScroll();
+  gridAllItems = items || [];
   container.innerHTML = "";
-  items.forEach((item) => {
-    const cell = document.createElement("button");
-    cell.type = "button";
-    cell.className = "thumb-cell";
-    cell.dataset.rowIndex = String(item.rowIndex);
+  container.dataset.renderedCount = "0";
+  container.scrollTop = 0;
 
-    const img = document.createElement("img");
-    img.alt = "Creative";
-    img.loading = "lazy";
-    img.draggable = false;
-    img.referrerPolicy = "no-referrer";
-    const mediaUrl = item.mediaUrl || item.thumbUrl;
-    const thumbUrl = item.thumbUrl;
-    const derivedPoster =
-      isVideoUrl(mediaUrl) && isAdclarityUrl(mediaUrl)
-        ? adclarityPosterFromMp4(mediaUrl)
-        : "";
-    const ytThumbs = isYoutubeUrl(mediaUrl) ? youtubeThumbCandidates(mediaUrl) : [];
-    setImgSrcWithFallback(img, [
-      thumbUrl,
-      derivedPoster,
-      derivedPoster ? adclarityJpgFromJpeg(derivedPoster) : "",
-      ...ytThumbs,
-      mediaUrl,
-    ]);
+  if (!gridAllItems.length) return;
 
-    const overlay = document.createElement("div");
-    overlay.className = "fault-overlay";
-    overlay.innerHTML = '<span class="fault-x" aria-hidden="true">✕</span>';
+  const sentinel = document.createElement("div");
+  sentinel.className = "grid-scroll-sentinel";
+  sentinel.setAttribute("aria-hidden", "true");
+  container.appendChild(sentinel);
 
-    cell.appendChild(img);
-    cell.appendChild(overlay);
-    cell._item = item;
-    applyFaultUi(item, cell, Boolean(item.isFault));
-    container.appendChild(cell);
-  });
+  appendGridBatch(container);
+  bindGridInfiniteScroll(container);
 }
 
 function updateGroupCountText() {
@@ -371,9 +439,9 @@ function setUiForMode() {
     btnOk.textContent = "✓ Continue";
     modeLabel.textContent = "Unavailable media — review table, then swipe";
   } else if (isUncertain) {
-    hintLeft.textContent = "← Wrong brand (group)";
+    hintLeft.textContent = "← Flag all as Incorrect";
     hintRight.textContent = "Correct brand (group) →";
-    btnFault.textContent = "✕ Wrong brand";
+    btnFault.textContent = "✕ Flag all as Incorrect";
     btnOk.textContent = "✓ Correct brand";
     modeLabel.textContent =
       "Uncertain ads · grouped by brand (grid: tap ✕ fault, right-click inspect)";
@@ -458,7 +526,9 @@ function showCard() {
     const items = item.items?.length ? item.items : [];
 
     const gridHint =
-      "Tap image to toggle ✕ fault · Right-click to inspect · Swipe for whole group";
+      items.length > GRID_BATCH_SIZE
+        ? "Scroll grid for more creatives · Tap ✕ fault · Right-click inspect · Swipe whole group"
+        : "Tap image to toggle ✕ fault · Right-click to inspect · Swipe for whole group";
     if (mode === "uncertain") {
       const reasonHint =
         item.reasonHint ||

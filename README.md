@@ -2,6 +2,27 @@
 
 Group creative ads **by brand** (advertiser name) and swipe-review them. Exports Excel with `isFault` and `advertiserMatch` columns.
 
+
+Cat with wry smile
+YAMI — Yet Another Media Inspector
+(https://yet-another-media-inspector.vercel.app)
+
+Feature:
++ attempt to group similar creatives together for ease of creative classification
++ Tinder swap (left arrow = mark as fault, right arrow = OK pass)
++ left click = toggle mark as Fault
++ right click = inspect media (pop-up)
++ Fault group = Mark all creatives in the group as faulty vs OK group (continue to next group)
++ Buy me a coffee
+
+Requirement:
++ input file: must have BRAND & CREATIVE_URL_SUPPLIER columns
+
+
+Status:
++ works well with ad-clarity urls, for tiktok & youtube still have some issues on fetching media
++ works with 5000 rows or less 
+
 ## Setup
 
 ```bash
