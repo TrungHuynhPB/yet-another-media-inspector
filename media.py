@@ -206,9 +206,21 @@ def _extract_og_image(html: str) -> str | None:
 CLAPTIK_BASE = os.environ.get("YAMI_CLAPTIK_BASE", "https://claptik.com").rstrip("/")
 CLAPTIK_AJAX = f"{CLAPTIK_BASE}/wp-admin/admin-ajax.php"
 _CLAPTIK_NONCE_RE = re.compile(r'"nonce"\s*:\s*"([^"]+)"')
+_CLAPTIK_HAS_TS_RE = re.compile(r'"hasTS"\s*:\s*(true|false)', re.IGNORECASE)
+_CLAPTIK_TS_SITE_RE = re.compile(r'"tsSite"\s*:\s*"([^"]+)"')
 _claptik_nonce_cache: dict[str, object] = {"nonce": "", "fetched_at": 0.0}
 _claptik_nonce_lock = threading.Lock()
 _claptik_skip_until = 0.0
+
+
+def tiktok_client_thumb_enabled() -> bool:
+    """Defer TikTok page thumbnails to the reviewer's browser (Claptik proxy)."""
+    return os.environ.get("YAMI_TIKTOK_CLIENT_THUMB", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
 
 
 def _claptik_enabled() -> bool:
@@ -276,22 +288,76 @@ def _claptik_thumbnail_from_meta(meta: dict) -> str | None:
     return None
 
 
-def _claptik_video_meta(client: httpx.Client, url: str) -> dict | None:
+def _parse_claptik_home(html: str) -> dict:
+    text = html or ""
+    nonce_m = _CLAPTIK_NONCE_RE.search(text)
+    ts_m = _CLAPTIK_HAS_TS_RE.search(text)
+    site_m = _CLAPTIK_TS_SITE_RE.search(text)
+    return {
+        "nonce": nonce_m.group(1) if nonce_m else "",
+        "hasTurnstile": (ts_m.group(1).lower() == "true") if ts_m else True,
+        "turnstileSiteKey": site_m.group(1) if site_m else "",
+    }
+
+
+def claptik_public_config() -> dict:
+    """Public config for browser-side Claptik thumbnail resolution."""
+    enabled = _claptik_enabled() and tiktok_client_thumb_enabled()
+    out = {
+        "enabled": enabled,
+        "ajax": CLAPTIK_AJAX,
+        "nonce": "",
+        "hasTurnstile": True,
+        "turnstileSiteKey": "",
+    }
+    if not enabled:
+        return out
+    try:
+        with httpx.Client(follow_redirects=True) as client:
+            out["nonce"] = _fetch_claptik_nonce(client)
+            resp = client.get(
+                f"{CLAPTIK_BASE}/",
+                timeout=20.0,
+                headers={
+                    "User-Agent": CHROME_USER_AGENT,
+                    "Accept": "text/html,application/xhtml+xml",
+                },
+            )
+            if resp.status_code == 200:
+                parsed = _parse_claptik_home(resp.text)
+                if parsed.get("nonce"):
+                    out["nonce"] = parsed["nonce"]
+                out["hasTurnstile"] = bool(parsed.get("hasTurnstile"))
+                out["turnstileSiteKey"] = parsed.get("turnstileSiteKey") or ""
+    except Exception as exc:
+        print(f"Claptik config failed: {exc}")
+    return out
+
+
+def _claptik_video_meta(
+    client: httpx.Client,
+    url: str,
+    *,
+    turnstile: str = "",
+    from_client: bool = False,
+) -> dict | None:
     """Resolve TikTok post metadata via claptik.com WordPress AJAX (tt_get_video)."""
     global _claptik_skip_until
-    if not _claptik_enabled() or time.time() < _claptik_skip_until:
+    if not _claptik_enabled():
+        return None
+    if not from_client and time.time() < _claptik_skip_until:
         return None
 
     nonce = _fetch_claptik_nonce(client)
     if not nonce:
         return None
 
-    turnstile = os.environ.get("YAMI_CLAPTIK_TURNSTILE_TOKEN", "").strip()
+    token = (turnstile or os.environ.get("YAMI_CLAPTIK_TURNSTILE_TOKEN", "")).strip()
     data = {
         "action": "tt_get_video",
         "nonce": nonce,
         "url": url,
-        "turnstile": turnstile,
+        "turnstile": token,
     }
     try:
         resp = client.post(
@@ -307,8 +373,7 @@ def _claptik_video_meta(client: httpx.Client, url: str) -> dict | None:
             msg = ""
             if isinstance(payload.get("data"), dict):
                 msg = str(payload["data"].get("message") or "")
-            if "turnstile" in msg.lower():
-                # Claptik requires Cloudflare Turnstile for server-side calls.
+            if "turnstile" in msg.lower() and not from_client:
                 _claptik_skip_until = time.time() + 300
             return None
         data_obj = payload.get("data")
@@ -316,6 +381,14 @@ def _claptik_video_meta(client: httpx.Client, url: str) -> dict | None:
     except Exception as exc:
         print(f"Claptik lookup failed {url}: {exc}")
         return None
+
+
+def claptik_lookup(url: str, *, turnstile: str = "") -> dict | None:
+    """Browser-initiated Claptik lookup (via YAMI proxy) with optional Turnstile token."""
+    if not url:
+        return None
+    with httpx.Client(follow_redirects=True) as client:
+        return _claptik_video_meta(client, url, turnstile=turnstile, from_client=True)
 
 
 def _resolve_claptik_thumbnail(
@@ -846,6 +919,9 @@ def _resolve_tiktok_thumbnail(
         if data:
             return save_bytes(out, data), None
         return None, "TikTok CDN image blocked or expired"
+
+    if tiktok_client_thumb_enabled() and is_tiktok_page_url(url):
+        return None, None
 
     try:
         # Prefer claptik.com (third-party resolver) → tnktok og:image → TikTok oEmbed.

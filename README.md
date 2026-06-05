@@ -52,7 +52,7 @@ Try `24`–`40` on a good connection; lower to `12`–`16` if you hit rate limit
 Thumbnails are resolved automatically when possible:
 
 - **YouTube** — tries several `img.youtube.com` poster sizes
-- **TikTok** — thumbnail fallback chain: [claptik.com](https://claptik.com/) (`tt_get_video` → `cover` / `images[]`) → `d.tnktok.com` og:image → TikTok oEmbed. Claptik may require `YAMI_CLAPTIK_TURNSTILE_TOKEN` on serverless (Cloudflare Turnstile); set `YAMI_CLAPTIK_ENABLED=0` to skip it.
+- **TikTok** — upload skips server TikTok page thumbs by default (`YAMI_TIKTOK_CLIENT_THUMB=1`). During review, the grid lazy-loads previews from the user's browser via `/api/claptik-thumb` (Claptik proxy + one-time Cloudflare Turnstile). Server fallbacks (Claptik → tnktok → oEmbed) still apply when `YAMI_TIKTOK_CLIENT_THUMB=0`.
 - **Adclarity video** — first tries the sibling **JPEG** URL (`…_video.mp4` → `….jpeg`, drop `_video`), then downloads the MP4 (partial or full) and extracts a frame with **OpenCV** if needed
 
 ### AdClarity tuning

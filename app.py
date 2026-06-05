@@ -13,7 +13,7 @@ from pathlib import Path
 
 import httpx
 import pandas as pd
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -31,13 +31,18 @@ from metadata import (
     prepare_upload_dataframe,
 )
 from media import (
+    _claptik_thumbnail_from_meta,
+    claptik_lookup,
+    claptik_public_config,
     detect_url_column,
+    is_tiktok_page_url,
     is_youtube_url,
     opencv_available,
     opencv_diagnostics,
     opencv_unavailable_reason,
     resolve_thumbnails_batch,
     thumbnail_concurrency,
+    tiktok_client_thumb_enabled,
     youtube_video_id,
 )
 
@@ -592,6 +597,12 @@ def _member_items(session_id: str, members: list[dict]) -> list[dict]:
             yt = _youtube_ui_thumb(m["url"])
             if yt:
                 item["thumbUrl"] = yt
+        if (
+            not m.get("thumb")
+            and is_tiktok_page_url(m["url"])
+            and tiktok_client_thumb_enabled()
+        ):
+            item["needsClientThumb"] = True
         items.append(item)
     return items
 
@@ -808,6 +819,51 @@ async def index():
 @app.get("/api/hints")
 async def get_hints():
     return {"hints": load_hints(), "hintRotateMs": hint_rotate_ms()}
+
+
+@app.get("/api/claptik-config")
+async def get_claptik_config():
+    """Config for lazy browser-side TikTok thumbnails via Claptik."""
+    return claptik_public_config()
+
+
+@app.post("/api/claptik-thumb")
+async def post_claptik_thumb(request: Request):
+    """Proxy a single TikTok URL to Claptik using a browser Turnstile token."""
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(400, "Invalid JSON body") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(400, "JSON object required")
+
+    url = str(body.get("url") or "").strip()
+    if not url:
+        raise HTTPException(400, "url is required")
+
+    turnstile = str(body.get("turnstile") or "").strip()
+    if not turnstile:
+        raise HTTPException(
+            428,
+            detail={
+                "needsTurnstile": True,
+                "message": "Cloudflare Turnstile verification required for Claptik.",
+            },
+        )
+
+    meta = await asyncio.to_thread(claptik_lookup, url, turnstile=turnstile)
+    if not meta:
+        raise HTTPException(404, "Claptik thumbnail unavailable")
+
+    thumb_url = _claptik_thumbnail_from_meta(meta)
+    if not thumb_url:
+        raise HTTPException(404, "Claptik returned no thumbnail URL")
+
+    return {
+        "thumbUrl": thumb_url,
+        "cover": meta.get("cover"),
+        "images": meta.get("images") or [],
+    }
 
 
 @app.get("/api/diagnostics")
