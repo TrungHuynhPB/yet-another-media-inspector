@@ -2,11 +2,14 @@
 
 import asyncio
 import hashlib
+import logging
 import os
 import re
 import sys
 import threading
 import time
+
+logger = logging.getLogger(__name__)
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -15,6 +18,8 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 
 DEFAULT_THUMBNAIL_WORKERS = 24
+SERVERLESS_THUMBNAIL_WORKERS = 6
+SERVERLESS_THUMB_MAX_PX = 240
 PARTIAL_VIDEO_BYTES = 2 * 1024 * 1024
 CHROME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -175,240 +180,6 @@ def is_tiktok_cdn_url(url: str) -> bool:
     )
 
 
-def tiktok_tnktok_url(url: str, *, host: str = "d.tnktok.com") -> str | None:
-    """Convert a tiktok.com page URL to tnktok.com (fxTikTok) URL.
-
-    We use this only as a best-effort source of a static preview image (via og:image).
-    """
-    try:
-        parsed = urlparse(url)
-        if "tiktok.com" not in (parsed.netloc or "").lower():
-            return None
-        return parsed._replace(scheme="https", netloc=host).geturl()
-    except Exception:
-        return None
-
-
-_OG_IMAGE_RE = re.compile(
-    r"""<meta\s+(?:property|name)=['"](?:og:image|twitter:image)['"]\s+content=['"]([^'"]+)['"]""",
-    re.IGNORECASE,
-)
-
-
-def _extract_og_image(html: str) -> str | None:
-    m = _OG_IMAGE_RE.search(html or "")
-    if not m:
-        return None
-    url = (m.group(1) or "").strip()
-    return url or None
-
-
-CLAPTIK_BASE = os.environ.get("YAMI_CLAPTIK_BASE", "https://claptik.com").rstrip("/")
-CLAPTIK_AJAX = f"{CLAPTIK_BASE}/wp-admin/admin-ajax.php"
-_CLAPTIK_NONCE_RE = re.compile(r'"nonce"\s*:\s*"([^"]+)"')
-_CLAPTIK_HAS_TS_RE = re.compile(r'"hasTS"\s*:\s*(true|false)', re.IGNORECASE)
-_CLAPTIK_TS_SITE_RE = re.compile(r'"tsSite"\s*:\s*"([^"]+)"')
-_claptik_nonce_cache: dict[str, object] = {"nonce": "", "fetched_at": 0.0}
-_claptik_nonce_lock = threading.Lock()
-_claptik_skip_until = 0.0
-
-
-def tiktok_client_thumb_enabled() -> bool:
-    """Defer TikTok page thumbnails to the reviewer's browser (Claptik proxy)."""
-    return os.environ.get("YAMI_TIKTOK_CLIENT_THUMB", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
-
-
-def _claptik_enabled() -> bool:
-    return os.environ.get("YAMI_CLAPTIK_ENABLED", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "off",
-    )
-
-
-def _claptik_headers() -> dict[str, str]:
-    return {
-        "User-Agent": CHROME_USER_AGENT,
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": f"{CLAPTIK_BASE}/",
-        "Origin": CLAPTIK_BASE,
-    }
-
-
-def _fetch_claptik_nonce(client: httpx.Client) -> str:
-    global _claptik_skip_until
-    now = time.time()
-    with _claptik_nonce_lock:
-        cached = str(_claptik_nonce_cache.get("nonce") or "")
-        fetched_at = float(_claptik_nonce_cache.get("fetched_at") or 0.0)
-        if cached and (now - fetched_at) < 1800:
-            return cached
-
-    resp = client.get(
-        f"{CLAPTIK_BASE}/",
-        timeout=20.0,
-        headers={
-            "User-Agent": CHROME_USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-        follow_redirects=True,
-    )
-    if resp.status_code != 200:
-        return ""
-    m = _CLAPTIK_NONCE_RE.search(resp.text or "")
-    nonce = m.group(1) if m else ""
-    if nonce:
-        with _claptik_nonce_lock:
-            _claptik_nonce_cache["nonce"] = nonce
-            _claptik_nonce_cache["fetched_at"] = now
-    return nonce
-
-
-def _claptik_thumbnail_from_meta(meta: dict) -> str | None:
-    if not isinstance(meta, dict):
-        return None
-    images = meta.get("images")
-    if isinstance(images, list):
-        for item in images:
-            url = str(item or "").strip()
-            if url.startswith("http"):
-                return url
-    for key in ("cover", "origin_cover", "dynamic_cover", "thumbnail", "thumbnail_url"):
-        url = str(meta.get(key) or "").strip()
-        if url.startswith("http"):
-            return url
-    return None
-
-
-def _parse_claptik_home(html: str) -> dict:
-    text = html or ""
-    nonce_m = _CLAPTIK_NONCE_RE.search(text)
-    ts_m = _CLAPTIK_HAS_TS_RE.search(text)
-    site_m = _CLAPTIK_TS_SITE_RE.search(text)
-    return {
-        "nonce": nonce_m.group(1) if nonce_m else "",
-        "hasTurnstile": (ts_m.group(1).lower() == "true") if ts_m else True,
-        "turnstileSiteKey": site_m.group(1) if site_m else "",
-    }
-
-
-def claptik_public_config() -> dict:
-    """Public config for browser-side Claptik thumbnail resolution."""
-    enabled = _claptik_enabled() and tiktok_client_thumb_enabled()
-    out = {
-        "enabled": enabled,
-        "ajax": CLAPTIK_AJAX,
-        "nonce": "",
-        "hasTurnstile": True,
-        "turnstileSiteKey": "",
-    }
-    if not enabled:
-        return out
-    try:
-        with httpx.Client(follow_redirects=True) as client:
-            out["nonce"] = _fetch_claptik_nonce(client)
-            resp = client.get(
-                f"{CLAPTIK_BASE}/",
-                timeout=20.0,
-                headers={
-                    "User-Agent": CHROME_USER_AGENT,
-                    "Accept": "text/html,application/xhtml+xml",
-                },
-            )
-            if resp.status_code == 200:
-                parsed = _parse_claptik_home(resp.text)
-                if parsed.get("nonce"):
-                    out["nonce"] = parsed["nonce"]
-                out["hasTurnstile"] = bool(parsed.get("hasTurnstile"))
-                out["turnstileSiteKey"] = parsed.get("turnstileSiteKey") or ""
-    except Exception as exc:
-        print(f"Claptik config failed: {exc}")
-    return out
-
-
-def _claptik_video_meta(
-    client: httpx.Client,
-    url: str,
-    *,
-    turnstile: str = "",
-    from_client: bool = False,
-) -> dict | None:
-    """Resolve TikTok post metadata via claptik.com WordPress AJAX (tt_get_video)."""
-    global _claptik_skip_until
-    if not _claptik_enabled():
-        return None
-    if not from_client and time.time() < _claptik_skip_until:
-        return None
-
-    nonce = _fetch_claptik_nonce(client)
-    if not nonce:
-        return None
-
-    token = (turnstile or os.environ.get("YAMI_CLAPTIK_TURNSTILE_TOKEN", "")).strip()
-    data = {
-        "action": "tt_get_video",
-        "nonce": nonce,
-        "url": url,
-        "turnstile": token,
-    }
-    try:
-        resp = client.post(
-            CLAPTIK_AJAX,
-            data=data,
-            timeout=25.0,
-            headers=_claptik_headers(),
-        )
-        if resp.status_code != 200:
-            return None
-        payload = resp.json()
-        if not isinstance(payload, dict) or not payload.get("success"):
-            msg = ""
-            if isinstance(payload.get("data"), dict):
-                msg = str(payload["data"].get("message") or "")
-            if "turnstile" in msg.lower() and not from_client:
-                _claptik_skip_until = time.time() + 300
-            return None
-        data_obj = payload.get("data")
-        return data_obj if isinstance(data_obj, dict) else None
-    except Exception as exc:
-        print(f"Claptik lookup failed {url}: {exc}")
-        return None
-
-
-def claptik_lookup(url: str, *, turnstile: str = "") -> dict | None:
-    """Browser-initiated Claptik lookup (via YAMI proxy) with optional Turnstile token."""
-    if not url:
-        return None
-    with httpx.Client(follow_redirects=True) as client:
-        return _claptik_video_meta(client, url, turnstile=turnstile, from_client=True)
-
-
-def _resolve_claptik_thumbnail(
-    client: httpx.Client, url: str, cache_dir: Path, key: str
-) -> tuple[Path | None, str | None]:
-    meta = _claptik_video_meta(client, url)
-    if not meta:
-        return None, None
-    thumb_url = _claptik_thumbnail_from_meta(meta)
-    if not thumb_url:
-        return None, "Claptik returned no thumbnail"
-    out = cache_dir / f"{key}_tt.jpg"
-    if out.is_file() and out.stat().st_size > 0:
-        return out, None
-    data = _try_download_image(client, thumb_url, timeout=25.0)
-    if data:
-        return save_bytes(out, data), None
-    return None, "Claptik thumbnail download failed"
-
-
 def browser_headers_for_url(url: str) -> dict[str, str]:
     """Headers that improve CDN hotlink fetches (e.g. Unilever, Adclarity)."""
     parsed = urlparse(url)
@@ -430,15 +201,7 @@ def browser_headers_for_url(url: str) -> dict[str, str]:
             "Sec-Fetch-Mode": "no-cors",
             "Sec-Fetch-Site": "cross-site",
         }
-    elif host.endswith("claptik.com"):
-        referer = f"{CLAPTIK_BASE}/"
-        user_agent = CHROME_USER_AGENT
-        extra = {
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-        }
-    elif "tiktok" in host or host.endswith("tnktok.com"):
+    elif "tiktok" in host:
         referer = "https://www.tiktok.com/"
         user_agent = TIKTOK_MOBILE_USER_AGENT
         extra = {
@@ -620,6 +383,12 @@ def adclarity_jpeg_from_mp4_url(url: str) -> str | None:
     return jpeg_url
 
 
+def adclarity_remote_thumbnail(url: str) -> str | None:
+    """Static AdClarity poster URL when available (no download)."""
+    candidates = adclarity_thumbnail_candidates(url)
+    return candidates[0] if candidates else None
+
+
 def adclarity_thumbnail_candidates(url: str, max_candidates: int = 3) -> list[str]:
     """Static AdClarity poster URLs to try before downloading MP4 / OpenCV."""
     if not is_adclarity_url(url):
@@ -756,10 +525,50 @@ async def fetch_bytes(client: httpx.AsyncClient, url: str, timeout: float = 30.0
         return None
 
 
+def _is_serverless() -> bool:
+    return bool(
+        os.environ.get("VERCEL")
+        or os.environ.get("VERCEL_ENV")
+        or os.environ.get("AWS_LAMBDA_FUNCTION_NAME")
+        or os.environ.get("LAMBDA_TASK_ROOT")
+    )
+
+
+def optimize_thumb_bytes(
+    data: bytes, max_px: int = SERVERLESS_THUMB_MAX_PX
+) -> bytes:
+    """Resize/compress JPEGs on serverless to keep /tmp under Vercel limits."""
+    try:
+        import io
+
+        from PIL import Image
+
+        with Image.open(io.BytesIO(data)) as img:
+            img = img.convert("RGB")
+            img.thumbnail((max_px, max_px), Image.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=72, optimize=True)
+            return buf.getvalue()
+    except Exception:
+        return data
+
+
 def save_bytes(path: Path, data: bytes) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if _is_serverless() and path.suffix.lower() in (".jpg", ".jpeg"):
+        data = optimize_thumb_bytes(data)
     path.write_bytes(data)
     return path
+
+
+def _remove_video_artifacts(cache_dir: Path, key: str, ext: str) -> None:
+    for name in (f"{key}_partial{ext}", f"{key}{ext}"):
+        p = cache_dir / name
+        try:
+            if p.is_file():
+                p.unlink()
+        except OSError:
+            pass
 
 
 def extract_video_frame(video_path: Path, out_path: Path) -> tuple[bool, str | None]:
@@ -907,6 +716,32 @@ def _resolve_youtube_thumbnail(
     return _try_urls_as_image(client, urls, cache_dir, key, "yt", timeout=20.0)
 
 
+def _tiktok_oembed_thumbnail_url(
+    client: httpx.Client, url: str
+) -> tuple[str | None, str | None]:
+    """oEmbed only — returns remote thumbnail URL without writing to disk."""
+    oembed = tiktok_oembed_url(url)
+    headers = browser_headers_for_url(oembed)
+    try:
+        resp = client.get(oembed, timeout=20.0, headers=headers)
+        if resp.status_code != 200:
+            fallback = tiktok_oembed_url(url)
+            if fallback != oembed:
+                resp = client.get(fallback, timeout=20.0, headers=headers)
+            if resp.status_code != 200:
+                return (
+                    None,
+                    "TikTok link unavailable (oEmbed blocked / mobile-only)",
+                )
+        thumb_url = resp.json().get("thumbnail_url")
+        if not thumb_url:
+            return None, "TikTok oEmbed returned no thumbnail"
+        return thumb_url, None
+    except Exception as exc:
+        print(f"TikTok oEmbed failed {url}: {exc}")
+        return None, "TikTok Shop / mobile-only link (thumbnail unavailable)"
+
+
 def _resolve_tiktok_thumbnail(
     client: httpx.Client, url: str, cache_dir: Path, key: str
 ) -> tuple[Path | None, str | None]:
@@ -920,34 +755,9 @@ def _resolve_tiktok_thumbnail(
             return save_bytes(out, data), None
         return None, "TikTok CDN image blocked or expired"
 
-    if tiktok_client_thumb_enabled() and is_tiktok_page_url(url):
-        return None, None
-
+    oembed = tiktok_oembed_url(url)
+    headers = browser_headers_for_url(oembed)
     try:
-        # Prefer claptik.com (third-party resolver) → tnktok og:image → TikTok oEmbed.
-        claptik, claptik_detail = _resolve_claptik_thumbnail(client, url, cache_dir, key)
-        if claptik:
-            return claptik, None
-
-        # Prefer tnktok.com (fxTikTok) for preview metadata; it can be less bot-sensitive
-        # than calling TikTok oEmbed directly from a serverless/datacenter IP.
-        tnktok = tiktok_tnktok_url(url)
-        if tnktok:
-            resp = client.get(
-                tnktok,
-                timeout=20.0,
-                headers=browser_headers_for_url(tnktok),
-                follow_redirects=True,
-            )
-            if resp.status_code == 200 and resp.text:
-                og_img = _extract_og_image(resp.text)
-                if og_img:
-                    data = _try_download_image(client, og_img, timeout=25.0)
-                    if data:
-                        return save_bytes(out, data), None
-
-        oembed = tiktok_oembed_url(url)
-        headers = browser_headers_for_url(oembed)
         resp = client.get(oembed, timeout=20.0, headers=headers)
         if resp.status_code != 200:
             # Some TikTok URLs only work via the "quoted original URL" form.
@@ -955,10 +765,10 @@ def _resolve_tiktok_thumbnail(
             if fallback != oembed:
                 resp = client.get(fallback, timeout=20.0, headers=headers)
             if resp.status_code != 200:
-                detail = claptik_detail or (
-                    "TikTok link unavailable (oEmbed blocked / mobile-only)"
+                return (
+                    None,
+                    "TikTok link unavailable (oEmbed blocked / mobile-only)",
                 )
-                return (None, detail)
         thumb_url = resp.json().get("thumbnail_url")
         if not thumb_url:
             return None, "TikTok oEmbed returned no thumbnail"
@@ -1021,6 +831,7 @@ def _resolve_video_poster(
     if partial_path:
         ok, frame_detail = extract_video_frame(partial_path, thumb_jpg)
         if ok:
+            _remove_video_artifacts(cache_dir, key, ext)
             return thumb_jpg, None
         last_detail = frame_detail
 
@@ -1035,9 +846,11 @@ def _resolve_video_poster(
     if vid_path.is_file():
         ok, frame_detail = extract_video_frame(vid_path, thumb_jpg)
         if ok:
+            _remove_video_artifacts(cache_dir, key, ext)
             return thumb_jpg, None
         last_detail = frame_detail
 
+    _remove_video_artifacts(cache_dir, key, ext)
     return (
         None,
         partial_detail or last_detail or "video download failed",
@@ -1046,11 +859,13 @@ def _resolve_video_poster(
 
 def thumbnail_concurrency() -> int:
     """Parallel download workers (env: YAMI_THUMBNAIL_WORKERS, default 24)."""
+    default = SERVERLESS_THUMBNAIL_WORKERS if _is_serverless() else DEFAULT_THUMBNAIL_WORKERS
     try:
-        n = int(os.environ.get("YAMI_THUMBNAIL_WORKERS", str(DEFAULT_THUMBNAIL_WORKERS)))
+        n = int(os.environ.get("YAMI_THUMBNAIL_WORKERS", str(default)))
     except ValueError:
-        n = DEFAULT_THUMBNAIL_WORKERS
-    return max(1, min(n, 64))
+        n = default
+    cap = 12 if _is_serverless() else 64
+    return max(1, min(n, cap))
 
 
 def _http_client() -> httpx.Client:
@@ -1074,13 +889,37 @@ def _thread_http_client() -> httpx.Client:
     return client
 
 
+def _serverless_remote_thumbnail(
+    client: httpx.Client, url: str
+) -> tuple[str | None, str | None]:
+    """CDN/oEmbed poster URL for Vercel — avoids /tmp writes and Blob uploads."""
+    if is_youtube_url(url):
+        remote = youtube_thumbnail_url(url)
+        return remote, None if remote else "YouTube thumbnail not found"
+    if is_tiktok_cdn_url(url):
+        return url, None
+    if is_tiktok_page_url(url):
+        return _tiktok_oembed_thumbnail_url(client, url)
+    ext = extension_from_url(url)
+    if ext in IMAGE_EXTENSIONS and not is_video_url(url):
+        return url, None
+    remote = adclarity_remote_thumbnail(url)
+    if remote:
+        return remote, None
+    if is_video_url(url) or ext in VIDEO_EXTENSIONS:
+        sibling = adclarity_jpeg_from_mp4_url(url)
+        if sibling:
+            return sibling, None
+    return None, None
+
+
 def resolve_thumbnail_with_client(
     url: str,
     cache_dir: Path,
     client: httpx.Client,
-) -> tuple[Path | None, str | None]:
+) -> tuple[Path | None, str | None, str | None]:
     if not url:
-        return None, None
+        return None, None, None
 
     cache_dir = Path(cache_dir)
     key = _cache_key(url)
@@ -1088,7 +927,14 @@ def resolve_thumbnail_with_client(
 
     cached = _existing_cached_thumb(cache_dir, key)
     if cached:
-        return cached, None
+        return cached, None, None
+
+    if _is_serverless():
+        remote, detail = _serverless_remote_thumbnail(client, url)
+        if remote:
+            return None, None, remote
+        if detail and is_tiktok_page_url(url):
+            return None, detail, None
 
     ext = extension_from_url(url)
     out = cache_dir / f"{key}{ext}"
@@ -1096,76 +942,106 @@ def resolve_thumbnail_with_client(
     adclarity_static = adclarity_thumbnail_candidates(url) if is_adclarity_url(url) else []
 
     if is_youtube_url(url):
+        if _is_serverless():
+            remote = youtube_thumbnail_url(url)
+            if remote:
+                return None, None, remote
         yt = _resolve_youtube_thumbnail(client, url, cache_dir, key)
         if yt:
-            return yt, None
+            return yt, None, None
 
     if is_tiktok_cdn_url(url):
         data = _try_download_image(client, url, timeout=30.0)
         if data:
-            return save_bytes(thumb_jpg, data), None
-        return None, "TikTok CDN image blocked or expired"
+            return save_bytes(thumb_jpg, data), None, None
+        return None, "TikTok CDN image blocked or expired", None
 
     if is_tiktok_page_url(url):
+        if _is_serverless():
+            remote, tt_detail = _tiktok_oembed_thumbnail_url(client, url)
+            if remote:
+                return None, None, remote
+            if tt_detail:
+                return None, tt_detail, None
         tt, tt_detail = _resolve_tiktok_thumbnail(client, url, cache_dir, key)
         if tt:
-            return tt, None
-        return None, tt_detail
+            return tt, None, None
+        return None, tt_detail, None
 
     if is_video_url(url) or ext in VIDEO_EXTENSIONS:
         poster, detail = _resolve_video_poster(
             client, url, cache_dir, key, adclarity_static
         )
-        return poster, detail
+        return poster, detail, None
 
     if ext in IMAGE_EXTENSIONS and not is_video_url(url):
         if out.is_file() and out.stat().st_size > 0:
-            return out, None
+            return out, None, None
         data = _try_download_image(
             client, url, timeout=60.0 if is_adclarity_url(url) else 30.0
         )
         if data:
-            return save_bytes(out, data), None
+            return save_bytes(out, data), None, None
         if adclarity_static:
             poster, detail = _resolve_video_poster(
                 client, url, cache_dir, key, adclarity_static
             )
             if poster:
-                return poster, None
+                return poster, None, None
             if detail:
-                return None, detail
+                return None, detail, None
         if is_youtube_url(url):
+            if _is_serverless():
+                remote = youtube_thumbnail_url(url)
+                if remote:
+                    return None, None, remote
             yt = _resolve_youtube_thumbnail(client, url, cache_dir, key)
             if yt:
-                return yt, None
+                return yt, None, None
         if is_tiktok_page_url(url):
+            if _is_serverless():
+                remote, tt_detail = _tiktok_oembed_thumbnail_url(client, url)
+                if remote:
+                    return None, None, remote
+                if tt_detail:
+                    return None, tt_detail, None
             tt, tt_detail = _resolve_tiktok_thumbnail(client, url, cache_dir, key)
             if tt:
-                return tt, None
-            return None, tt_detail or "image download failed"
-        return None, "image download failed or not image bytes"
+                return tt, None, None
+            return None, tt_detail or "image download failed", None
+        return None, "image download failed or not image bytes", None
 
     data, fetch_detail = _fetch_bytes_sync(
         client, url, timeout=120.0 if is_adclarity_url(url) else 60.0
     )
     if not data:
         if is_youtube_url(url):
+            if _is_serverless():
+                remote = youtube_thumbnail_url(url)
+                if remote:
+                    return None, None, remote
             yt = _resolve_youtube_thumbnail(client, url, cache_dir, key)
-            return yt, None if yt else fetch_detail
+            return yt, None if yt else fetch_detail, None
         if is_tiktok_page_url(url) or is_tiktok_cdn_url(url):
+            if _is_serverless() and is_tiktok_page_url(url):
+                remote, tt_detail = _tiktok_oembed_thumbnail_url(client, url)
+                if remote:
+                    return None, None, remote
+                if tt_detail:
+                    return None, tt_detail, None
             tt, tt_detail = _resolve_tiktok_thumbnail(client, url, cache_dir, key)
             if tt:
-                return tt, None
-            return None, tt_detail or fetch_detail
-        return None, fetch_detail
+                return tt, None, None
+            return None, tt_detail or fetch_detail, None
+        return None, fetch_detail, None
 
     if is_image_bytes(data):
         guessed = extension_from_url(url)
         img_path = cache_dir / f"{key}{guessed}"
-        return save_bytes(img_path, data), None
+        return save_bytes(img_path, data), None, None
 
     if thumb_jpg.is_file():
-        return thumb_jpg, None
+        return thumb_jpg, None, None
     guessed = extension_from_url(url)
     if guessed in VIDEO_EXTENSIONS or is_video_url(url):
         vid_path = cache_dir / f"{key}{guessed}"
@@ -1175,27 +1051,39 @@ def resolve_thumbnail_with_client(
                 client, url, cache_dir, key, adclarity_static
             )
             if poster:
-                return poster, None
+                return poster, None, None
             if detail:
-                return None, detail
+                return None, detail, None
         ok, frame_detail = extract_video_frame(vid_path, thumb_jpg)
         if ok:
-            return thumb_jpg, None
-        return None, frame_detail or "could not extract frame from downloaded video"
+            _remove_video_artifacts(cache_dir, key, guessed)
+            return thumb_jpg, None, None
+        _remove_video_artifacts(cache_dir, key, guessed)
+        return None, frame_detail or "could not extract frame from downloaded video", None
 
     if is_youtube_url(url):
+        if _is_serverless():
+            remote = youtube_thumbnail_url(url)
+            if remote:
+                return None, None, remote
         yt = _resolve_youtube_thumbnail(client, url, cache_dir, key)
-        return yt, None if yt else "YouTube thumbnail not found"
+        return yt, None if yt else "YouTube thumbnail not found", None
     if is_tiktok_page_url(url) or is_tiktok_cdn_url(url):
+        if _is_serverless() and is_tiktok_page_url(url):
+            remote, tt_detail = _tiktok_oembed_thumbnail_url(client, url)
+            if remote:
+                return None, None, remote
+            if tt_detail:
+                return None, tt_detail, None
         tt, tt_detail = _resolve_tiktok_thumbnail(client, url, cache_dir, key)
-        return tt, tt_detail
-    return None, "unsupported media type"
+        return tt, tt_detail, None
+    return None, "unsupported media type", None
 
 
 def resolve_thumbnail_blocking(url: str, cache_dir: Path) -> Path | None:
     """Sync thumbnail resolver for a single URL."""
     with _http_client() as client:
-        path, _detail = resolve_thumbnail_with_client(url, cache_dir, client)
+        path, _detail, _remote = resolve_thumbnail_with_client(url, cache_dir, client)
         return path
 
 
@@ -1204,30 +1092,34 @@ def resolve_thumbnails_batch(
     cache_dir: Path,
     max_workers: int | None = None,
     on_progress=None,
-) -> tuple[dict[str, Path | None], dict[str, str]]:
+) -> tuple[dict[str, Path | None], dict[str, str], dict[str, str]]:
     """Fetch thumbnails in parallel; each distinct URL is downloaded at most once."""
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     unique_urls = list(dict.fromkeys(u for u in urls if u))
     if not unique_urls:
-        return {}, {}
+        return {}, {}, {}
 
     workers = max_workers if max_workers is not None else thumbnail_concurrency()
-    workers = max(1, min(workers, len(unique_urls), 64))
+    cap = 12 if _is_serverless() else 64
+    workers = max(1, min(workers, len(unique_urls), cap))
     results: dict[str, Path | None] = {}
     failures: dict[str, str] = {}
+    remotes: dict[str, str] = {}
     downloaded = 0
 
-    def fetch_one(url: str) -> tuple[str, Path | None, str | None]:
+    def fetch_one(url: str) -> tuple[str, Path | None, str | None, str | None]:
         try:
             with _host_request_slot(url):
                 client = _thread_http_client()
-                path, detail = resolve_thumbnail_with_client(url, cache_dir, client)
+                path, detail, remote = resolve_thumbnail_with_client(
+                    url, cache_dir, client
+                )
                 if path and not path.is_file():
-                    return url, None, "thumbnail file missing after download"
-                return url, path, detail
+                    return url, None, "thumbnail file missing after download", remote
+                return url, path, detail, remote
         except Exception as exc:
-            return url, None, str(exc)
+            return url, None, str(exc), None
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         future_to_url = {
@@ -1237,22 +1129,24 @@ def resolve_thumbnails_batch(
         for fut in as_completed(future_to_url):
             url = future_to_url[fut]
             try:
-                _url, path, detail = fut.result()
+                _url, path, detail, remote = fut.result()
             except Exception as exc:
                 logger.exception("Thumbnail worker failed for %s", url)
-                path, detail = None, str(exc)
+                path, detail, remote = None, str(exc), None
             results[url] = path
-            if not path and detail:
+            if remote:
+                remotes[url] = remote
+            if not path and not remote and detail:
                 failures[url] = detail
                 if is_adclarity_url(url):
                     print(f"AdClarity thumb failed {url[:80]}: {detail}")
             done += 1
-            if path:
+            if path or remote:
                 downloaded += 1
             if on_progress:
                 on_progress(done, len(unique_urls), downloaded)
 
-    return results, failures
+    return results, failures, remotes
 
 
 def extension_from_url(url: str, content_type: str | None = None) -> str:

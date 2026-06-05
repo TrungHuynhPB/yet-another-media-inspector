@@ -13,8 +13,14 @@ from pathlib import Path
 
 import httpx
 import pandas as pd
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 
 from brand_grouping import build_brand_groups
@@ -31,18 +37,13 @@ from metadata import (
     prepare_upload_dataframe,
 )
 from media import (
-    _claptik_thumbnail_from_meta,
-    claptik_lookup,
-    claptik_public_config,
     detect_url_column,
-    is_tiktok_page_url,
     is_youtube_url,
     opencv_available,
     opencv_diagnostics,
     opencv_unavailable_reason,
     resolve_thumbnails_batch,
     thumbnail_concurrency,
-    tiktok_client_thumb_enabled,
     youtube_video_id,
 )
 
@@ -98,6 +99,17 @@ def _reject_oversized_upload(raw: bytes) -> None:
 def _blob_enabled() -> bool:
     # Uses the Blob REST API directly (no SDK dependency).
     return bool(_is_serverless() and os.environ.get("BLOB_READ_WRITE_TOKEN"))
+
+
+def _blob_thumbs_enabled() -> bool:
+    """Per-thumbnail Blob uploads are opt-in — each PUT counts as an advanced op."""
+    if not _blob_enabled():
+        return False
+    return os.environ.get("YAMI_BLOB_THUMBS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
 
 def _blob_headers() -> dict[str, str]:
@@ -161,9 +173,9 @@ def _blob_get_bytes(pathname: str, *, timeout: float = 20.0) -> bytes | None:
         return None
 
 
-def _blob_put_bytes(pathname: str, data: bytes, *, content_type: str) -> None:
+def _blob_put_bytes(pathname: str, data: bytes, *, content_type: str) -> str | None:
     if not _blob_enabled():
-        return
+        return None
     try:
         # Vercel Blob upload uses PUT /?pathname=...
         resp = httpx.put(
@@ -184,8 +196,10 @@ def _blob_put_bytes(pathname: str, data: bytes, *, content_type: str) -> None:
         info = resp.json()
         if isinstance(info, dict) and info.get("pathname"):
             _blob_index[info["pathname"]] = info
+            return info.get("downloadUrl") or info.get("url")
     except Exception as exc:
         logger.warning("Blob put failed %s: %s", pathname, exc)
+    return None
 
 
 def _ensure_data_dirs() -> None:
@@ -321,7 +335,8 @@ def _persist_upload_source(session_id: str, raw: bytes, filename: str) -> None:
     out_dir = _session_dir(session_id)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"source{ext}"
-    path.write_bytes(raw)
+    if not (_is_serverless() and _blob_enabled()):
+        path.write_bytes(raw)
     _blob_put_bytes(
         _source_blob_paths(session_id, ext),
         raw,
@@ -334,6 +349,64 @@ def _persist_upload_source(session_id: str, raw: bytes, filename: str) -> None:
         meta,
         content_type="application/json",
     )
+
+
+def _thumb_blob_pathname(session_id: str, filename: str) -> str:
+    return f"sessions/{session_id}/thumbs/{filename}"
+
+
+def _persist_thumb_to_blob(session_id: str, thumb_path: Path) -> str | None:
+    if not thumb_path.is_file() or not _blob_enabled():
+        return None
+    data = thumb_path.read_bytes()
+    url = _blob_put_bytes(
+        _thumb_blob_pathname(session_id, thumb_path.name),
+        data,
+        content_type="image/jpeg",
+    )
+    try:
+        thumb_path.unlink()
+    except OSError as exc:
+        logger.warning("Could not delete local thumb %s: %s", thumb_path, exc)
+    return url
+
+
+def _purge_session_cache(session_id: str) -> None:
+    cache_dir = _session_dir(session_id) / "cache"
+    if not cache_dir.is_dir():
+        return
+    for path in cache_dir.iterdir():
+        try:
+            if path.is_file():
+                path.unlink()
+        except OSError as exc:
+            logger.warning("Could not delete cache file %s: %s", path, exc)
+
+
+def _finalize_session_thumbs(session_id: str, rows: list[dict]) -> None:
+    """Free /tmp after grouping; optional Blob offload (off by default on Vercel)."""
+    if _blob_thumbs_enabled():
+        for row in rows:
+            thumb = row.get("thumb")
+            if not thumb or row.get("thumbRemote"):
+                continue
+            path = Path(thumb)
+            if not path.is_file():
+                row["thumb"] = None
+                continue
+            url = _persist_thumb_to_blob(session_id, path)
+            if url:
+                row["thumbRemote"] = url
+                row["thumb"] = None
+    else:
+        for row in rows:
+            if row.get("thumb") and not row.get("thumbRemote"):
+                row["thumb"] = None
+    _purge_session_cache(session_id)
+
+
+def _row_has_thumb(row: dict) -> bool:
+    return bool(row.get("thumb") or row.get("thumbRemote"))
 
 
 def _load_source_filename(session_id: str, sess: dict | None = None) -> str:
@@ -591,18 +664,14 @@ def _member_items(session_id: str, members: list[dict]) -> list[dict]:
             "isFault": bool(m.get("isFault", False)),
             "metadata": m.get("metadata") or {},
         }
-        if m.get("thumb"):
+        if m.get("thumbRemote"):
+            item["thumbUrl"] = m["thumbRemote"]
+        elif m.get("thumb"):
             item["thumbUrl"] = _thumb_url(session_id, m["thumb"])
         elif is_youtube_url(m["url"]):
             yt = _youtube_ui_thumb(m["url"])
             if yt:
                 item["thumbUrl"] = yt
-        if (
-            not m.get("thumb")
-            and is_tiktok_page_url(m["url"])
-            and tiktok_client_thumb_enabled()
-        ):
-            item["needsClientThumb"] = True
         items.append(item)
     return items
 
@@ -670,6 +739,7 @@ def _make_row(
     thumb: Path | None,
     thumb_fetch_detail: str | None = None,
     faulty_col: str | None = None,
+    thumb_remote: str | None = None,
 ) -> dict:
     pre_fault = (
         parse_is_faulty_value(df.iloc[idx][faulty_col])
@@ -682,6 +752,7 @@ def _make_row(
         "brandName": _cell_str(df.iloc[idx][brand_col]),
         "advertiserName": _advertiser_for_row(df, idx, adv_col),
         "thumb": str(thumb) if thumb else None,
+        "thumbRemote": thumb_remote,
         "metadata": row_metadata(df, idx, meta_lookup),
         "isFault": pre_fault,
         "advertiserMatch": None,
@@ -692,6 +763,26 @@ def _make_row(
     if thumb_fetch_detail:
         row["thumbFetchDetail"] = thumb_fetch_detail
     return row
+
+
+def _resolve_row_thumb(
+    url: str,
+    thumb: Path | None,
+    remote: str | None,
+    fetch_failures: dict[str, str],
+) -> tuple[Path | None, str | None, str | None]:
+    """Validate local thumb; prefer remote URL when download was skipped."""
+    if remote:
+        return None, remote, None
+    validated = _validated_thumb(thumb, url, fetch_failures)
+    if validated:
+        return validated, None, None
+    if url and is_youtube_url(url):
+        yt = _youtube_ui_thumb(url)
+        if yt:
+            return None, yt, None
+    detail = fetch_failures.get(url) if url and not validated else None
+    return None, None, detail
 
 
 def _urls_from_column(df: pd.DataFrame, col: str) -> list[str]:
@@ -718,7 +809,7 @@ async def _download_rows(
         row_count = done
         downloaded = dl
 
-    thumb_by_url, fetch_failures = await asyncio.to_thread(
+    thumb_by_url, fetch_failures, remote_by_url = await asyncio.to_thread(
         resolve_thumbnails_batch,
         urls,
         cache_dir,
@@ -730,12 +821,14 @@ async def _download_rows(
     rows: list[dict] = []
     row_downloaded = 0
     for idx, url in enumerate(urls):
-        thumb = _validated_thumb(
-            thumb_by_url.get(url) if url else None, url, fetch_failures
+        thumb, remote, detail = _resolve_row_thumb(
+            url,
+            thumb_by_url.get(url) if url else None,
+            remote_by_url.get(url) if url else None,
+            fetch_failures,
         )
-        if thumb:
+        if thumb or remote:
             row_downloaded += 1
-        detail = fetch_failures.get(url) if url and not thumb else None
         rows.append(
             _make_row(
                 df,
@@ -747,6 +840,7 @@ async def _download_rows(
                 thumb,
                 detail,
                 faulty_col,
+                remote,
             )
         )
         if on_progress:
@@ -778,6 +872,8 @@ def _finalize_session(
     if not group_list and not uncertain_list and not unavailable_media:
         raise HTTPException(400, "No groupable rows found.")
 
+    _finalize_session_thumbs(session_id, rows)
+
     _session_put(
         session_id,
         {
@@ -799,7 +895,7 @@ def _finalize_session(
     return {
         "sessionId": session_id,
         "totalRows": len(rows),
-        "downloaded": sum(1 for r in rows if r.get("thumb")),
+        "downloaded": sum(1 for r in rows if _row_has_thumb(r)),
         "groupCount": len(group_list),
         "uncertainCount": len(uncertain_list),
         "unavailableCount": unavailable_media["count"] if unavailable_media else 0,
@@ -821,51 +917,6 @@ async def get_hints():
     return {"hints": load_hints(), "hintRotateMs": hint_rotate_ms()}
 
 
-@app.get("/api/claptik-config")
-async def get_claptik_config():
-    """Config for lazy browser-side TikTok thumbnails via Claptik."""
-    return claptik_public_config()
-
-
-@app.post("/api/claptik-thumb")
-async def post_claptik_thumb(request: Request):
-    """Proxy a single TikTok URL to Claptik using a browser Turnstile token."""
-    try:
-        body = await request.json()
-    except Exception as exc:
-        raise HTTPException(400, "Invalid JSON body") from exc
-    if not isinstance(body, dict):
-        raise HTTPException(400, "JSON object required")
-
-    url = str(body.get("url") or "").strip()
-    if not url:
-        raise HTTPException(400, "url is required")
-
-    turnstile = str(body.get("turnstile") or "").strip()
-    if not turnstile:
-        raise HTTPException(
-            428,
-            detail={
-                "needsTurnstile": True,
-                "message": "Cloudflare Turnstile verification required for Claptik.",
-            },
-        )
-
-    meta = await asyncio.to_thread(claptik_lookup, url, turnstile=turnstile)
-    if not meta:
-        raise HTTPException(404, "Claptik thumbnail unavailable")
-
-    thumb_url = _claptik_thumbnail_from_meta(meta)
-    if not thumb_url:
-        raise HTTPException(404, "Claptik returned no thumbnail URL")
-
-    return {
-        "thumbUrl": thumb_url,
-        "cover": meta.get("cover"),
-        "images": meta.get("images") or [],
-    }
-
-
 @app.get("/api/diagnostics")
 async def get_diagnostics():
     """Environment check (OpenCV / Python path) — useful when video thumbs all fail."""
@@ -874,6 +925,7 @@ async def get_diagnostics():
     info["dataDir"] = str(DATA_DIR)
     info["dataDirWritable"] = DATA_DIR.exists() and os.access(DATA_DIR, os.W_OK)
     info["blobEnabled"] = _blob_enabled()
+    info["blobThumbsEnabled"] = _blob_thumbs_enabled()
     info["blobTokenPresent"] = bool(os.environ.get("BLOB_READ_WRITE_TOKEN"))
     info["blobLibAvailable"] = True
     info["maxUploadBytes"] = MAX_UPLOAD_BYTES
@@ -949,7 +1001,7 @@ async def _process_job(
                 downloaded=dl,
             )
 
-        thumb_by_url, fetch_failures = await asyncio.to_thread(
+        thumb_by_url, fetch_failures, remote_by_url = await asyncio.to_thread(
             resolve_thumbnails_batch,
             urls,
             cache_dir,
@@ -960,10 +1012,12 @@ async def _process_job(
         faulty_col = detect_is_faulty_column(list(df.columns))
         rows = []
         for idx, url in enumerate(urls):
-            thumb = _validated_thumb(
-                thumb_by_url.get(url) if url else None, url, fetch_failures
+            thumb, remote, detail = _resolve_row_thumb(
+                url,
+                thumb_by_url.get(url) if url else None,
+                remote_by_url.get(url) if url else None,
+                fetch_failures,
             )
-            detail = fetch_failures.get(url) if url and not thumb else None
             rows.append(
                 _make_row(
                     df,
@@ -975,6 +1029,7 @@ async def _process_job(
                     thumb,
                     detail,
                     faulty_col,
+                    remote,
                 )
             )
             if idx % 5 == 0 or idx + 1 == total:
@@ -985,7 +1040,7 @@ async def _process_job(
                     total=total,
                     percent=min(pct, 94),
                     phase="download",
-                    downloaded=sum(1 for r in rows if r.get("thumb")),
+                    downloaded=sum(1 for r in rows if _row_has_thumb(r)),
                 )
 
         _job_update(
@@ -1224,16 +1279,18 @@ async def upload_stream(
                 )
                 await asyncio.sleep(0.25)
 
-            thumb_by_url, fetch_failures = batch_task.result()
+            thumb_by_url, fetch_failures, remote_by_url = batch_task.result()
             rows = []
             downloaded = 0
             for idx, url in enumerate(urls):
-                thumb = _validated_thumb(
-                    thumb_by_url.get(url) if url else None, url, fetch_failures
+                thumb, remote, detail = _resolve_row_thumb(
+                    url,
+                    thumb_by_url.get(url) if url else None,
+                    remote_by_url.get(url) if url else None,
+                    fetch_failures,
                 )
-                if thumb:
+                if thumb or remote:
                     downloaded += 1
-                detail = fetch_failures.get(url) if url and not thumb else None
                 rows.append(
                     _make_row(
                         df,
@@ -1245,6 +1302,7 @@ async def upload_stream(
                         thumb,
                         detail,
                         faulty_col,
+                        remote,
                     )
                 )
                 if idx % 5 == 0 or idx + 1 == total:
@@ -1357,9 +1415,15 @@ async def _process_upload(file: UploadFile, url_column: str):
 async def serve_thumb(session_id: str, filename: str):
     cache = _session_dir(session_id) / "cache"
     path = cache / filename
-    if not path.exists() or not str(path.resolve()).startswith(str(cache.resolve())):
-        raise HTTPException(404)
-    return FileResponse(path)
+    if path.exists() and str(path.resolve()).startswith(str(cache.resolve())):
+        return FileResponse(path)
+    if _blob_enabled():
+        blob = _blob_find(_thumb_blob_pathname(session_id, filename))
+        if blob:
+            url = blob.get("downloadUrl") or blob.get("url")
+            if url:
+                return RedirectResponse(url, status_code=307)
+    raise HTTPException(404)
 
 
 @app.post("/api/session/{session_id}/review")

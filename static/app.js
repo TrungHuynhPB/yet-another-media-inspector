@@ -271,198 +271,14 @@ function isGridReviewMode() {
 }
 
 const GRID_BATCH_SIZE = 48;
-const TIKTOK_THUMB_CONCURRENCY = 2;
 let gridAllItems = [];
 let gridLoadObserver = null;
-let tiktokThumbObserver = null;
-let claptikConfig = null;
-let claptikTurnstileToken = "";
-const tiktokThumbCache = new Map();
-const tiktokThumbQueue = [];
-let tiktokThumbInflight = 0;
 
 function disconnectGridInfiniteScroll() {
   if (gridLoadObserver) {
     gridLoadObserver.disconnect();
     gridLoadObserver = null;
   }
-}
-
-function needsLazyTikTokThumb(item) {
-  if (!item || item.needsClientThumb) return Boolean(item?.needsClientThumb);
-  const url = item.mediaUrl || "";
-  if (!isTikTokUrl(url)) return false;
-  const thumb = item.thumbUrl || "";
-  if (!thumb) return true;
-  if (thumb.includes("/api/thumb/")) return false;
-  return thumb === url;
-}
-
-async function loadClaptikConfig() {
-  if (claptikConfig) return claptikConfig;
-  try {
-    const res = await fetch("/api/claptik-config");
-    if (!res.ok) return { enabled: false };
-    claptikConfig = await res.json();
-  } catch {
-    claptikConfig = { enabled: false };
-  }
-  return claptikConfig;
-}
-
-function ensureTurnstileScript() {
-  return new Promise((resolve, reject) => {
-    if (window.turnstile) {
-      resolve();
-      return;
-    }
-    const existing = document.querySelector('script[src*="turnstile/v0/api.js"]');
-    if (existing) {
-      existing.addEventListener("load", () => resolve(), { once: true });
-      existing.addEventListener("error", () => reject(new Error("Turnstile failed")), {
-        once: true,
-      });
-      return;
-    }
-    const script = document.createElement("script");
-    script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
-    script.async = true;
-    script.onload = () => resolve();
-    script.onerror = () => reject(new Error("Turnstile failed"));
-    document.head.appendChild(script);
-  });
-}
-
-async function ensureClaptikTurnstile() {
-  if (claptikTurnstileToken) return claptikTurnstileToken;
-  const cfg = await loadClaptikConfig();
-  if (!cfg.enabled || !cfg.hasTurnstile || !cfg.turnstileSiteKey) return "";
-
-  const modal = $("claptik-turnstile-modal");
-  const mount = $("claptik-turnstile-mount");
-  if (!modal || !mount) return "";
-
-  try {
-    await ensureTurnstileScript();
-  } catch {
-    return "";
-  }
-
-  return new Promise((resolve) => {
-    modal.classList.remove("hidden");
-    mount.innerHTML = "";
-    try {
-      window.turnstile.render(mount, {
-        sitekey: cfg.turnstileSiteKey,
-        callback: (token) => {
-          claptikTurnstileToken = token || "";
-          modal.classList.add("hidden");
-          resolve(claptikTurnstileToken);
-        },
-        "error-callback": () => {
-          modal.classList.add("hidden");
-          resolve("");
-        },
-        "expired-callback": () => {
-          claptikTurnstileToken = "";
-        },
-      });
-    } catch {
-      modal.classList.add("hidden");
-      resolve("");
-    }
-  });
-}
-
-async function fetchClaptikThumb(mediaUrl) {
-  if (!mediaUrl) return null;
-  if (tiktokThumbCache.has(mediaUrl)) return tiktokThumbCache.get(mediaUrl);
-
-  const cfg = await loadClaptikConfig();
-  if (!cfg.enabled) return null;
-
-  let turnstile = claptikTurnstileToken;
-  if (cfg.hasTurnstile && !turnstile) {
-    turnstile = await ensureClaptikTurnstile();
-  }
-  if (cfg.hasTurnstile && !turnstile) return null;
-
-  try {
-    const res = await fetch("/api/claptik-thumb", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: mediaUrl, turnstile }),
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const thumb = data.thumbUrl || null;
-    if (thumb) tiktokThumbCache.set(mediaUrl, thumb);
-    return thumb;
-  } catch {
-    return null;
-  }
-}
-
-function drainTikTokThumbQueue() {
-  while (tiktokThumbInflight < TIKTOK_THUMB_CONCURRENCY && tiktokThumbQueue.length) {
-    const job = tiktokThumbQueue.shift();
-    tiktokThumbInflight += 1;
-    loadTikTokThumbForCell(job).finally(() => {
-      tiktokThumbInflight -= 1;
-      drainTikTokThumbQueue();
-    });
-  }
-}
-
-function queueTikTokThumb(cell, mediaUrl, img) {
-  tiktokThumbQueue.push({ cell, mediaUrl, img });
-  drainTikTokThumbQueue();
-}
-
-async function loadTikTokThumbForCell({ cell, mediaUrl, img }) {
-  if (cell.dataset.tiktokThumbLoaded === "1") return;
-  cell.dataset.tiktokThumbLoaded = "loading";
-  const thumb = await fetchClaptikThumb(mediaUrl);
-  if (!thumb) {
-    cell.dataset.tiktokThumbLoaded = "failed";
-    return;
-  }
-  img.referrerPolicy = "no-referrer";
-  img.src = thumb;
-  cell.classList.remove("thumb-cell--tiktok-pending");
-  cell.dataset.tiktokThumbLoaded = "1";
-}
-
-function disconnectLazyTikTokThumbs() {
-  if (tiktokThumbObserver) {
-    tiktokThumbObserver.disconnect();
-    tiktokThumbObserver = null;
-  }
-}
-
-function observeLazyTikTokThumbs(container) {
-  disconnectLazyTikTokThumbs();
-  const cells = container.querySelectorAll("[data-needs-tiktok-thumb='1']");
-  if (!cells.length) return;
-
-  tiktokThumbObserver = new IntersectionObserver(
-    (entries) => {
-      for (const entry of entries) {
-        if (!entry.isIntersecting) continue;
-        const cell = entry.target;
-        if (cell.dataset.tiktokThumbLoaded) {
-          tiktokThumbObserver.unobserve(cell);
-          continue;
-        }
-        tiktokThumbObserver.unobserve(cell);
-        const img = cell.querySelector("img");
-        const mediaUrl = cell.dataset.mediaUrl || "";
-        if (img && mediaUrl) queueTikTokThumb(cell, mediaUrl, img);
-      }
-    },
-    { root: container, rootMargin: "120px", threshold: 0.01 }
-  );
-  for (const cell of cells) tiktokThumbObserver.observe(cell);
 }
 
 function createThumbCell(item) {
@@ -478,27 +294,18 @@ function createThumbCell(item) {
   img.referrerPolicy = "no-referrer";
   const mediaUrl = item.mediaUrl || item.thumbUrl;
   const thumbUrl = item.thumbUrl;
-  const lazyTikTok = needsLazyTikTokThumb(item);
-
-  if (lazyTikTok) {
-    cell.classList.add("thumb-cell--tiktok-pending");
-    cell.dataset.needsTiktokThumb = "1";
-    cell.dataset.mediaUrl = item.mediaUrl || "";
-    img.alt = "TikTok preview";
-  } else {
-    const derivedPoster =
-      isVideoUrl(mediaUrl) && isAdclarityUrl(mediaUrl)
-        ? adclarityPosterFromMp4(mediaUrl)
-        : "";
-    const ytThumbs = isYoutubeUrl(mediaUrl) ? youtubeThumbCandidates(mediaUrl) : [];
-    setImgSrcWithFallback(img, [
-      thumbUrl,
-      derivedPoster,
-      derivedPoster ? adclarityJpgFromJpeg(derivedPoster) : "",
-      ...ytThumbs,
-      mediaUrl,
-    ]);
-  }
+  const derivedPoster =
+    isVideoUrl(mediaUrl) && isAdclarityUrl(mediaUrl)
+      ? adclarityPosterFromMp4(mediaUrl)
+      : "";
+  const ytThumbs = isYoutubeUrl(mediaUrl) ? youtubeThumbCandidates(mediaUrl) : [];
+  setImgSrcWithFallback(img, [
+    thumbUrl,
+    derivedPoster,
+    derivedPoster ? adclarityJpgFromJpeg(derivedPoster) : "",
+    ...ytThumbs,
+    mediaUrl,
+  ]);
 
   const overlay = document.createElement("div");
   overlay.className = "fault-overlay";
@@ -522,7 +329,6 @@ function appendGridBatch(container) {
   for (const item of batch) {
     container.insertBefore(createThumbCell(item), sentinel);
   }
-  observeLazyTikTokThumbs(container);
 
   const nextCount = rendered + batch.length;
   container.dataset.renderedCount = String(nextCount);
@@ -587,7 +393,6 @@ function bindGridInteractions() {
 
 function renderBrandGrid(container, items) {
   disconnectGridInfiniteScroll();
-  disconnectLazyTikTokThumbs();
   gridAllItems = items || [];
   container.innerHTML = "";
   container.dataset.renderedCount = "0";
@@ -602,7 +407,6 @@ function renderBrandGrid(container, items) {
 
   appendGridBatch(container);
   bindGridInfiniteScroll(container);
-  observeLazyTikTokThumbs(container);
 }
 
 function updateGroupCountText() {
@@ -1281,10 +1085,6 @@ function resetForNewUpload() {
   cursor = 0;
   mode = "unavailable";
   reviewing = false;
-  claptikConfig = null;
-  claptikTurnstileToken = "";
-  tiktokThumbCache.clear();
-  tiktokThumbQueue.length = 0;
   $("file-input").value = "";
   setFileSelectedName("");
   uploadedFilename = "";
@@ -1519,15 +1319,6 @@ $("bmc-link").addEventListener("click", (e) => {
   e.preventDefault();
   openCoffeeModal();
 });
-function closeClaptikTurnstileModal() {
-  $("claptik-turnstile-modal")?.classList.add("hidden");
-}
-
-$("claptik-turnstile-close")?.addEventListener("click", closeClaptikTurnstileModal);
-$("claptik-turnstile-modal")
-  ?.querySelector(".claptik-turnstile-backdrop")
-  ?.addEventListener("click", closeClaptikTurnstileModal);
-
 $("coffee-close").addEventListener("click", closeCoffeeModal);
 $("coffee-modal").querySelector(".coffee-backdrop").addEventListener("click", closeCoffeeModal);
 document.querySelectorAll(".coffee-tab").forEach((tab) => {
@@ -1543,7 +1334,6 @@ $("context-menu").addEventListener("click", (e) => e.stopPropagation());
 document.addEventListener("click", () => hideContextMenu());
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
-    closeClaptikTurnstileModal();
     closeInspectModal();
     hideContextMenu();
   }

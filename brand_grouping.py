@@ -94,7 +94,7 @@ def _build_uncertain_groups(
     eligible = [
         row
         for row in uncertain_rows
-        if row.get("url") and row.get("thumb")
+        if row.get("url") and (row.get("thumb") or row.get("thumbRemote"))
     ]
     by_brand: dict[str, list[dict]] = defaultdict(list)
     for row in eligible:
@@ -139,7 +139,7 @@ def _build_uncertain_groups(
 def build_unavailable_media(rows: list[dict]) -> dict | None:
     entries = []
     for row in rows:
-        if row.get("thumb") or not row.get("url"):
+        if row.get("thumb") or row.get("thumbRemote") or not row.get("url"):
             continue
         url = row["url"]
         fetch_detail = (row.get("thumbFetchDetail") or "").strip()
@@ -212,15 +212,17 @@ def build_brand_groups(
             thumb = m.get("thumb")
             if thumb and not Path(thumb).is_file():
                 m["thumb"] = None
-        with_thumb = [m for m in brand_members if m.get("thumb")]
+        with_thumb_local = [m for m in brand_members if m.get("thumb")]
         for m in brand_members:
-            if not m.get("thumb"):
+            if not m.get("thumb") and not m.get("thumbRemote"):
                 m["uncertainReason"] = "missing_thumb"
                 m["groupId"] = None
 
         subgroups: list[list[dict]] = []
-        if len(with_thumb) >= MIN_ITEMS_FOR_VISUAL_SUBGROUPING:
-            with_thumb_valid = [m for m in with_thumb if Path(m["thumb"]).is_file()]
+        if len(with_thumb_local) >= MIN_ITEMS_FOR_VISUAL_SUBGROUPING:
+            with_thumb_valid = [
+                m for m in with_thumb_local if Path(m["thumb"]).is_file()
+            ]
             thumb_paths = [m["thumb"] for m in with_thumb_valid]
             k = optimal_k(len(thumb_paths))
             grouper = KMeansGrouper(k=k, resample=128)
@@ -239,7 +241,26 @@ def build_brand_groups(
                 else:
                     subgroups.append(ms)
         else:
-            subgroups = [with_thumb] if with_thumb else []
+            groupable = [
+                m
+                for m in brand_members
+                if m.get("thumb") or m.get("thumbRemote")
+            ]
+            subgroups = [groupable] if groupable else []
+
+        grouped_ids = {int(m["index"]) for sg in subgroups for m in sg}
+        remote_or_unclustered = [
+            m
+            for m in brand_members
+            if int(m["index"]) not in grouped_ids
+            and (m.get("thumbRemote") or m.get("thumb"))
+            and not m.get("uncertainReason")
+        ]
+        if remote_or_unclustered:
+            if subgroups:
+                subgroups[0].extend(remote_or_unclustered)
+            else:
+                subgroups = [remote_or_unclustered]
 
         n_groups = len(subgroups)
         for sg_i, members_in_group in enumerate(subgroups):
