@@ -175,6 +175,34 @@ def is_tiktok_cdn_url(url: str) -> bool:
     )
 
 
+def tiktok_tnktok_url(url: str, *, host: str = "d.tnktok.com") -> str | None:
+    """Convert a tiktok.com page URL to tnktok.com (fxTikTok) URL.
+
+    We use this only as a best-effort source of a static preview image (via og:image).
+    """
+    try:
+        parsed = urlparse(url)
+        if "tiktok.com" not in (parsed.netloc or "").lower():
+            return None
+        return parsed._replace(scheme="https", netloc=host).geturl()
+    except Exception:
+        return None
+
+
+_OG_IMAGE_RE = re.compile(
+    r"""<meta\s+(?:property|name)=['"](?:og:image|twitter:image)['"]\s+content=['"]([^'"]+)['"]""",
+    re.IGNORECASE,
+)
+
+
+def _extract_og_image(html: str) -> str | None:
+    m = _OG_IMAGE_RE.search(html or "")
+    if not m:
+        return None
+    url = (m.group(1) or "").strip()
+    return url or None
+
+
 def browser_headers_for_url(url: str) -> dict[str, str]:
     """Headers that improve CDN hotlink fetches (e.g. Unilever, Adclarity)."""
     parsed = urlparse(url)
@@ -196,7 +224,7 @@ def browser_headers_for_url(url: str) -> dict[str, str]:
             "Sec-Fetch-Mode": "no-cors",
             "Sec-Fetch-Site": "cross-site",
         }
-    elif "tiktok" in host:
+    elif "tiktok" in host or host.endswith("tnktok.com"):
         referer = "https://www.tiktok.com/"
         user_agent = TIKTOK_MOBILE_USER_AGENT
         extra = {
@@ -678,9 +706,26 @@ def _resolve_tiktok_thumbnail(
             return save_bytes(out, data), None
         return None, "TikTok CDN image blocked or expired"
 
-    oembed = tiktok_oembed_url(url)
-    headers = browser_headers_for_url(oembed)
     try:
+        # Prefer tnktok.com (fxTikTok) for preview metadata; it can be less bot-sensitive
+        # than calling TikTok oEmbed directly from a serverless/datacenter IP.
+        tnktok = tiktok_tnktok_url(url)
+        if tnktok:
+            resp = client.get(
+                tnktok,
+                timeout=20.0,
+                headers=browser_headers_for_url(tnktok),
+                follow_redirects=True,
+            )
+            if resp.status_code == 200 and resp.text:
+                og_img = _extract_og_image(resp.text)
+                if og_img:
+                    data = _try_download_image(client, og_img, timeout=25.0)
+                    if data:
+                        return save_bytes(out, data), None
+
+        oembed = tiktok_oembed_url(url)
+        headers = browser_headers_for_url(oembed)
         resp = client.get(oembed, timeout=20.0, headers=headers)
         if resp.status_code != 200:
             # Some TikTok URLs only work via the "quoted original URL" form.
