@@ -203,6 +203,139 @@ def _extract_og_image(html: str) -> str | None:
     return url or None
 
 
+CLAPTIK_BASE = os.environ.get("YAMI_CLAPTIK_BASE", "https://claptik.com").rstrip("/")
+CLAPTIK_AJAX = f"{CLAPTIK_BASE}/wp-admin/admin-ajax.php"
+_CLAPTIK_NONCE_RE = re.compile(r'"nonce"\s*:\s*"([^"]+)"')
+_claptik_nonce_cache: dict[str, object] = {"nonce": "", "fetched_at": 0.0}
+_claptik_nonce_lock = threading.Lock()
+_claptik_skip_until = 0.0
+
+
+def _claptik_enabled() -> bool:
+    return os.environ.get("YAMI_CLAPTIK_ENABLED", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _claptik_headers() -> dict[str, str]:
+    return {
+        "User-Agent": CHROME_USER_AGENT,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": f"{CLAPTIK_BASE}/",
+        "Origin": CLAPTIK_BASE,
+    }
+
+
+def _fetch_claptik_nonce(client: httpx.Client) -> str:
+    global _claptik_skip_until
+    now = time.time()
+    with _claptik_nonce_lock:
+        cached = str(_claptik_nonce_cache.get("nonce") or "")
+        fetched_at = float(_claptik_nonce_cache.get("fetched_at") or 0.0)
+        if cached and (now - fetched_at) < 1800:
+            return cached
+
+    resp = client.get(
+        f"{CLAPTIK_BASE}/",
+        timeout=20.0,
+        headers={
+            "User-Agent": CHROME_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        follow_redirects=True,
+    )
+    if resp.status_code != 200:
+        return ""
+    m = _CLAPTIK_NONCE_RE.search(resp.text or "")
+    nonce = m.group(1) if m else ""
+    if nonce:
+        with _claptik_nonce_lock:
+            _claptik_nonce_cache["nonce"] = nonce
+            _claptik_nonce_cache["fetched_at"] = now
+    return nonce
+
+
+def _claptik_thumbnail_from_meta(meta: dict) -> str | None:
+    if not isinstance(meta, dict):
+        return None
+    images = meta.get("images")
+    if isinstance(images, list):
+        for item in images:
+            url = str(item or "").strip()
+            if url.startswith("http"):
+                return url
+    for key in ("cover", "origin_cover", "dynamic_cover", "thumbnail", "thumbnail_url"):
+        url = str(meta.get(key) or "").strip()
+        if url.startswith("http"):
+            return url
+    return None
+
+
+def _claptik_video_meta(client: httpx.Client, url: str) -> dict | None:
+    """Resolve TikTok post metadata via claptik.com WordPress AJAX (tt_get_video)."""
+    global _claptik_skip_until
+    if not _claptik_enabled() or time.time() < _claptik_skip_until:
+        return None
+
+    nonce = _fetch_claptik_nonce(client)
+    if not nonce:
+        return None
+
+    turnstile = os.environ.get("YAMI_CLAPTIK_TURNSTILE_TOKEN", "").strip()
+    data = {
+        "action": "tt_get_video",
+        "nonce": nonce,
+        "url": url,
+        "turnstile": turnstile,
+    }
+    try:
+        resp = client.post(
+            CLAPTIK_AJAX,
+            data=data,
+            timeout=25.0,
+            headers=_claptik_headers(),
+        )
+        if resp.status_code != 200:
+            return None
+        payload = resp.json()
+        if not isinstance(payload, dict) or not payload.get("success"):
+            msg = ""
+            if isinstance(payload.get("data"), dict):
+                msg = str(payload["data"].get("message") or "")
+            if "turnstile" in msg.lower():
+                # Claptik requires Cloudflare Turnstile for server-side calls.
+                _claptik_skip_until = time.time() + 300
+            return None
+        data_obj = payload.get("data")
+        return data_obj if isinstance(data_obj, dict) else None
+    except Exception as exc:
+        print(f"Claptik lookup failed {url}: {exc}")
+        return None
+
+
+def _resolve_claptik_thumbnail(
+    client: httpx.Client, url: str, cache_dir: Path, key: str
+) -> tuple[Path | None, str | None]:
+    meta = _claptik_video_meta(client, url)
+    if not meta:
+        return None, None
+    thumb_url = _claptik_thumbnail_from_meta(meta)
+    if not thumb_url:
+        return None, "Claptik returned no thumbnail"
+    out = cache_dir / f"{key}_tt.jpg"
+    if out.is_file() and out.stat().st_size > 0:
+        return out, None
+    data = _try_download_image(client, thumb_url, timeout=25.0)
+    if data:
+        return save_bytes(out, data), None
+    return None, "Claptik thumbnail download failed"
+
+
 def browser_headers_for_url(url: str) -> dict[str, str]:
     """Headers that improve CDN hotlink fetches (e.g. Unilever, Adclarity)."""
     parsed = urlparse(url)
@@ -223,6 +356,14 @@ def browser_headers_for_url(url: str) -> dict[str, str]:
             "Sec-Fetch-Dest": "image" if is_image else "video",
             "Sec-Fetch-Mode": "no-cors",
             "Sec-Fetch-Site": "cross-site",
+        }
+    elif host.endswith("claptik.com"):
+        referer = f"{CLAPTIK_BASE}/"
+        user_agent = CHROME_USER_AGENT
+        extra = {
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
         }
     elif "tiktok" in host or host.endswith("tnktok.com"):
         referer = "https://www.tiktok.com/"
@@ -707,6 +848,11 @@ def _resolve_tiktok_thumbnail(
         return None, "TikTok CDN image blocked or expired"
 
     try:
+        # Prefer claptik.com (third-party resolver) → tnktok og:image → TikTok oEmbed.
+        claptik, claptik_detail = _resolve_claptik_thumbnail(client, url, cache_dir, key)
+        if claptik:
+            return claptik, None
+
         # Prefer tnktok.com (fxTikTok) for preview metadata; it can be less bot-sensitive
         # than calling TikTok oEmbed directly from a serverless/datacenter IP.
         tnktok = tiktok_tnktok_url(url)
@@ -733,10 +879,10 @@ def _resolve_tiktok_thumbnail(
             if fallback != oembed:
                 resp = client.get(fallback, timeout=20.0, headers=headers)
             if resp.status_code != 200:
-                return (
-                    None,
-                    "TikTok link unavailable (oEmbed blocked / mobile-only)",
+                detail = claptik_detail or (
+                    "TikTok link unavailable (oEmbed blocked / mobile-only)"
                 )
+                return (None, detail)
         thumb_url = resp.json().get("thumbnail_url")
         if not thumb_url:
             return None, "TikTok oEmbed returned no thumbnail"
