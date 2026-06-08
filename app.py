@@ -706,18 +706,36 @@ def _load_dataframe(raw: bytes, filename: str) -> pd.DataFrame:
     raise HTTPException(400, "Upload .xlsx, .xls, .csv, or .json")
 
 
-def _resolve_columns(df: pd.DataFrame, url_column: str) -> tuple[str, str, str | None]:
+def _default_url_column(columns: list[str]) -> str | None:
+    lower = {c.lower(): c for c in columns}
+    if "creative_url_supplier" in lower:
+        return lower["creative_url_supplier"]
+    return detect_url_column(columns)
+
+
+def _default_brand_column(columns: list[str]) -> str | None:
+    lower = {c.lower(): c for c in columns}
+    if "brand" in lower:
+        return lower["brand"]
+    return detect_brand_column(columns)
+
+
+def _resolve_columns(
+    df: pd.DataFrame, url_column: str, brand_column: str = ""
+) -> tuple[str, str, str | None]:
     col = url_column.strip() if url_column else None
     if not col:
-        col = detect_url_column(list(df.columns))
+        col = _default_url_column(list(df.columns))
     if not col or col not in df.columns:
         raise HTTPException(
             400,
             f"URL column not found. Columns: {list(df.columns)}. "
             "Pass url_column in the form.",
         )
-    brand_col = detect_brand_column(list(df.columns))
+    brand_col = brand_column.strip() if brand_column else None
     if not brand_col:
+        brand_col = _default_brand_column(list(df.columns))
+    if not brand_col or brand_col not in df.columns:
         raise HTTPException(400, brand_column_error(list(df.columns)))
     adv_col = detect_advertiser_name_column(list(df.columns))
     return col, brand_col, adv_col
@@ -1078,10 +1096,27 @@ async def _process_job(
         _job_update(job_id, status="error", error=str(exc), percent=0)
 
 
+@app.post("/api/preview-columns")
+async def preview_columns(file: UploadFile = File(...)):
+    """Read spreadsheet headers so the client can offer column pickers before upload."""
+    filename = file.filename or ""
+    raw = await file.read()
+    _reject_oversized_upload(raw)
+    df = await asyncio.to_thread(_load_dataframe, raw, filename)
+    columns = list(df.columns)
+    return {
+        "filename": filename,
+        "columns": columns,
+        "defaultUrlColumn": _default_url_column(columns),
+        "defaultBrandColumn": _default_brand_column(columns),
+    }
+
+
 @app.post("/api/jobs")
 async def create_job(
     file: UploadFile = File(...),
     url_column: str = Form(""),
+    brand_column: str = Form(""),
 ):
     """Start processing; poll GET /api/jobs/{id} unless serverless returns result inline."""
     try:
@@ -1089,7 +1124,7 @@ async def create_job(
         raw = await file.read()
         _reject_oversized_upload(raw)
         df = await asyncio.to_thread(_load_dataframe, raw, file.filename or "")
-        col, brand_col, adv_col = _resolve_columns(df, url_column)
+        col, brand_col, adv_col = _resolve_columns(df, url_column, brand_column)
         meta_lookup = column_lookup(df)
 
         job_id = str(uuid.uuid4())
@@ -1172,6 +1207,7 @@ async def get_job_status(job_id: str):
 async def upload_stream(
     file: UploadFile = File(...),
     url_column: str = Form(""),
+    brand_column: str = Form(""),
 ):
     filename = file.filename or ""
     hints = load_hints()
@@ -1213,7 +1249,7 @@ async def upload_stream(
             await asyncio.sleep(0)
 
             df = await asyncio.to_thread(_load_dataframe, raw, filename)
-            col, brand_col, adv_col = _resolve_columns(df, url_column)
+            col, brand_col, adv_col = _resolve_columns(df, url_column, brand_column)
             meta_lookup = column_lookup(df)
             faulty_col = detect_is_faulty_column(list(df.columns))
             total = len(df)
@@ -1378,10 +1414,11 @@ def _stream_line(payload: dict) -> str:
 async def upload(
     file: UploadFile = File(...),
     url_column: str = Form(""),
+    brand_column: str = Form(""),
     k_groups: int = Form(0),  # kept for API compat; ignored (brand grouping)
 ):
     try:
-        return await _process_upload(file, url_column)
+        return await _process_upload(file, url_column, brand_column)
     except HTTPException:
         raise
     except Exception as e:
@@ -1389,11 +1426,11 @@ async def upload(
         return JSONResponse(status_code=500, content={"detail": str(e)})
 
 
-async def _process_upload(file: UploadFile, url_column: str):
+async def _process_upload(file: UploadFile, url_column: str, brand_column: str = ""):
     _ensure_data_dirs()
     raw = await file.read()
     df = await asyncio.to_thread(_load_dataframe, raw, file.filename or "")
-    col, brand_col, adv_col = _resolve_columns(df, url_column)
+    col, brand_col, adv_col = _resolve_columns(df, url_column, brand_column)
     meta_lookup = column_lookup(df)
     session_id = str(uuid.uuid4())
     _persist_upload_source(session_id, raw, file.filename or "")

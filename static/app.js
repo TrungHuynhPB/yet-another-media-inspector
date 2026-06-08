@@ -96,6 +96,88 @@ function setFileSelectedName(name) {
   el.classList.remove("hidden");
 }
 
+function resetColumnConfig() {
+  const config = $("column-config");
+  const hint = $("file-columns-hint");
+  const urlSel = $("url-column");
+  const brandSel = $("brand-column");
+  const btn = $("upload-btn");
+  if (config) config.classList.add("hidden");
+  if (hint) hint.textContent = "";
+  if (urlSel) {
+    urlSel.innerHTML = "";
+    urlSel.disabled = true;
+  }
+  if (brandSel) {
+    brandSel.innerHTML = "";
+    brandSel.disabled = true;
+  }
+  if (btn) btn.disabled = true;
+}
+
+function populateColumnSelect(selectEl, columns, selected) {
+  selectEl.innerHTML = "";
+  for (const col of columns) {
+    const opt = document.createElement("option");
+    opt.value = col;
+    opt.textContent = col;
+    if (col === selected) opt.selected = true;
+    selectEl.appendChild(opt);
+  }
+  if (!selected && columns.length) {
+    selectEl.value = columns[0];
+  }
+  selectEl.disabled = false;
+}
+
+async function previewFileColumns(file) {
+  resetColumnConfig();
+  if (!file) return;
+
+  const sizeErr = validateUploadFile(file);
+  if (sizeErr) {
+    setStatus(sizeErr);
+    return;
+  }
+
+  setStatus("Reading column names…");
+  const fd = new FormData();
+  fd.append("file", file);
+
+  let data;
+  try {
+    const res = await fetch("/api/preview-columns", { method: "POST", body: fd });
+    data = await parseJsonResponse(res);
+    if (!res.ok) {
+      throw new Error(
+        typeof data.detail === "string" ? data.detail : httpErrorMessage(res.status)
+      );
+    }
+  } catch (err) {
+    setStatus(err.message || String(err));
+    return;
+  }
+
+  const columns = data.columns || [];
+  if (!columns.length) {
+    setStatus("No columns found in file.");
+    return;
+  }
+
+  const urlSel = $("url-column");
+  const brandSel = $("brand-column");
+  populateColumnSelect(urlSel, columns, data.defaultUrlColumn || null);
+  populateColumnSelect(brandSel, columns, data.defaultBrandColumn || null);
+
+  const hint = $("file-columns-hint");
+  if (hint) {
+    hint.textContent = `${columns.length} column${columns.length === 1 ? "" : "s"}: ${columns.join(", ")}`;
+  }
+  $("column-config")?.classList.remove("hidden");
+  $("upload-btn").disabled = false;
+  setStatus("Choose URL and brand columns, then upload.");
+}
+
 function setReviewFilename(name) {
   const el = $("review-filename");
   if (!el) return;
@@ -1087,6 +1169,7 @@ function resetForNewUpload() {
   reviewing = false;
   $("file-input").value = "";
   setFileSelectedName("");
+  resetColumnConfig();
   uploadedFilename = "";
   setReviewFilename("");
   setStatus("");
@@ -1280,6 +1363,12 @@ if (fileInput) {
   fileInput.addEventListener("change", () => {
     const f = fileInput.files && fileInput.files[0];
     setFileSelectedName(f ? f.name : "");
+    if (f) {
+      previewFileColumns(f);
+    } else {
+      resetColumnConfig();
+      setStatus("");
+    }
   });
 }
 
@@ -1357,9 +1446,17 @@ $("upload-form").addEventListener("submit", async (e) => {
   uploadedFilename = fileInput.files[0]?.name || "";
   setReviewFilename(uploadedFilename);
 
+  const urlCol = $("url-column");
+  const brandCol = $("brand-column");
+  if (!urlCol?.value || !brandCol?.value) {
+    setStatus("Select URL and brand columns before uploading.");
+    return;
+  }
+
   const fd = new FormData();
   fd.append("file", fileInput.files[0]);
-  fd.append("url_column", $("url-column").value.trim());
+  fd.append("url_column", urlCol.value);
+  fd.append("brand_column", brandCol.value);
   fd.append("k_groups", "0");
 
   try {

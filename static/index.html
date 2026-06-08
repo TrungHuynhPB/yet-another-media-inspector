@@ -36,11 +36,18 @@
           <span>Choose Excel, CSV, or JSON file</span>
         </label>
         <p id="file-selected" class="file-selected hidden"></p>
-        <label>
-          URL column (optional — auto-detected)
-          <input type="text" id="url-column" placeholder="CREATIVE_URL_SUPPLIER" />
-        </label>
-        <button type="submit" id="upload-btn">Upload &amp; Group by brand</button>
+        <div id="column-config" class="column-config hidden">
+          <p id="file-columns-hint" class="file-columns-hint"></p>
+          <label>
+            URL column (optional — auto-detected)
+            <select id="url-column" disabled></select>
+          </label>
+          <label>
+            Brand column (optional — auto-detected)
+            <select id="brand-column" disabled></select>
+          </label>
+        </div>
+        <button type="submit" id="upload-btn" disabled>Upload &amp; Group by brand</button>
       </form>
       <p id="upload-status" class="status"></p>
 
