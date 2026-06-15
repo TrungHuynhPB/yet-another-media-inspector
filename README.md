@@ -133,3 +133,20 @@ Wider layout (up to ~1280px) with **larger thumbnails** in the grid (~200–260p
 ## Output
 
 `isFault`, `advertiserMatch`, and `reviewed` columns are added to the exported `.xlsx`.
+
+## Vercel Blob usage
+
+Logo and donation QR images are served from `/static/` (deployed with the app) — they do **not** use Blob.
+
+On Vercel, session data still uses Blob when `BLOB_READ_WRITE_TOKEN` is set:
+
+| When | Blob puts (typical) |
+|------|---------------------|
+| Upload | 2 (source file + metadata) + 2 (session pickle + review snapshot) |
+| Group / unavailable / uncertain swipe | 2 (pickle + review snapshot) |
+| Per-image ✕ toggle | 0 (local `/tmp` only until next swipe) |
+| Download export | 1 (export checkpoint) |
+
+Keep **`YAMI_BLOB_THUMBS` unset** — enabling it uploads every thumbnail to Blob (one put per image).
+
+Check `/api/diagnostics` on your deploy for `blobEnabled` / `blobThumbsEnabled`.

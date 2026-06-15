@@ -2,9 +2,5 @@ data/
 __pycache__/
 *.pyc
 .venv/
-/static/whitelogo.png
-/static/whitelogo_plain.png
 /static/blacklogo.png
 /static/logo.svg
-/static/qr.jpg
-/static/qr_global.jpg

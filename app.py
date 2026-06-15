@@ -288,13 +288,18 @@ def _merge_review_snapshot(sess: dict, snapshot: dict) -> None:
             row["advertiserName"] = state["advertiserName"]
 
 
-def _write_review_snapshot(session_id: str, sess: dict) -> None:
+def _write_review_snapshot(
+    session_id: str, sess: dict, *, to_blob: bool = False
+) -> None:
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(_review_snapshot(sess)).encode("utf-8")
     _review_path(session_id).write_bytes(payload)
-    _blob_put_bytes(
-        f"sessions/{session_id}.review.json", payload, content_type="application/json"
-    )
+    if to_blob and _blob_enabled():
+        _blob_put_bytes(
+            f"sessions/{session_id}.review.json",
+            payload,
+            content_type="application/json",
+        )
 
 
 def _load_review_snapshot(session_id: str) -> dict | None:
@@ -504,17 +509,18 @@ def _build_export_from_artifacts(session_id: str) -> bytes | None:
     return buf.getvalue()
 
 
-def _checkpoint_export(session_id: str, sess: dict) -> None:
+def _checkpoint_export(session_id: str, sess: dict, *, to_blob: bool = False) -> None:
     try:
         data = _build_export_bytes(sess)
         path = _export_checkpoint_path(session_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
-        _blob_put_bytes(
-            f"sessions/{session_id}/export.xlsx",
-            data,
-            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        if to_blob and _blob_enabled():
+            _blob_put_bytes(
+                f"sessions/{session_id}/export.xlsx",
+                data,
+                content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
     except Exception as exc:
         logger.warning("Export checkpoint failed for %s: %s", session_id, exc)
 
@@ -578,11 +584,18 @@ def _session_get(session_id: str) -> dict | None:
 
 
 def _session_put(session_id: str, sess: dict, *, full: bool = True) -> None:
+    """Persist session state.
+
+    On Vercel, Blob puts are minimized:
+    - full=True (group swipe): pickle + review snapshot to Blob
+    - full=False (per-image toggle): local /tmp only — no Blob puts
+    - export.xlsx to Blob only when the user downloads (see export endpoint)
+    """
     _sessions[session_id] = sess
     if not _is_serverless():
         if full:
             try:
-                _checkpoint_export(session_id, sess)
+                _checkpoint_export(session_id, sess, to_blob=False)
             except Exception:
                 pass
         return
@@ -592,9 +605,12 @@ def _session_put(session_id: str, sess: dict, *, full: bool = True) -> None:
         data = pickle.dumps(sess, protocol=pickle.HIGHEST_PROTOCOL)
         path.write_bytes(data)
         _blob_put_bytes(f"sessions/{session_id}.pkl", data, content_type="application/octet-stream")
-    _write_review_snapshot(session_id, sess)
+    _write_review_snapshot(session_id, sess, to_blob=full)
     if full:
-        _checkpoint_export(session_id, sess)
+        try:
+            _checkpoint_export(session_id, sess, to_blob=False)
+        except Exception:
+            pass
 
 
 def _job_get(job_id: str) -> dict | None:
@@ -1649,7 +1665,7 @@ async def export_xlsx(session_id: str):
     if sess:
         try:
             data = await asyncio.to_thread(_build_export_bytes, sess)
-            await asyncio.to_thread(_checkpoint_export, session_id, sess)
+            await asyncio.to_thread(_checkpoint_export, session_id, sess, to_blob=True)
             return _export_file_response(data, download_name)
         except Exception as exc:
             logger.exception("Export from session failed %s: %s", session_id, exc)
