@@ -112,6 +112,17 @@ def _blob_thumbs_enabled() -> bool:
     )
 
 
+def _blob_session_enabled() -> bool:
+    """Persist sessions to Blob (pickle, review, source). Off by default — review is client-side."""
+    if not _blob_enabled():
+        return False
+    return os.environ.get("YAMI_BLOB_SESSION", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 def _blob_headers() -> dict[str, str]:
     return {
         "authorization": f"Bearer {os.environ.get('BLOB_READ_WRITE_TOKEN','')}",
@@ -294,7 +305,7 @@ def _write_review_snapshot(
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(_review_snapshot(sess)).encode("utf-8")
     _review_path(session_id).write_bytes(payload)
-    if to_blob and _blob_enabled():
+    if to_blob and _blob_session_enabled():
         _blob_put_bytes(
             f"sessions/{session_id}.review.json",
             payload,
@@ -304,7 +315,7 @@ def _write_review_snapshot(
 
 def _load_review_snapshot(session_id: str) -> dict | None:
     path = _review_path(session_id)
-    if not path.is_file() and _blob_enabled():
+    if not path.is_file() and _blob_session_enabled():
         data = _blob_get_bytes(f"sessions/{session_id}.review.json", timeout=20.0)
         if data:
             _ensure_data_dirs()
@@ -316,7 +327,7 @@ def _load_review_snapshot(session_id: str) -> dict | None:
             logger.warning("Failed to read review snapshot %s: %s", session_id, exc)
     # Legacy faults-only snapshot
     legacy = SESSIONS_DIR / f"{session_id}.faults.json"
-    if not legacy.is_file() and _blob_enabled():
+    if not legacy.is_file() and _blob_session_enabled():
         data = _blob_get_bytes(f"sessions/{session_id}.faults.json", timeout=15.0)
         if data:
             _ensure_data_dirs()
@@ -340,20 +351,21 @@ def _persist_upload_source(session_id: str, raw: bytes, filename: str) -> None:
     out_dir = _session_dir(session_id)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"source{ext}"
-    if not (_is_serverless() and _blob_enabled()):
-        path.write_bytes(raw)
-    _blob_put_bytes(
-        _source_blob_paths(session_id, ext),
-        raw,
-        content_type="application/octet-stream",
-    )
+    path.write_bytes(raw)
+    if _blob_session_enabled():
+        _blob_put_bytes(
+            _source_blob_paths(session_id, ext),
+            raw,
+            content_type="application/octet-stream",
+        )
     meta = json.dumps({"filename": filename or "upload.xlsx"}).encode("utf-8")
     (out_dir / "source_meta.json").write_bytes(meta)
-    _blob_put_bytes(
-        f"sessions/{session_id}/source_meta.json",
-        meta,
-        content_type="application/json",
-    )
+    if _blob_session_enabled():
+        _blob_put_bytes(
+            f"sessions/{session_id}/source_meta.json",
+            meta,
+            content_type="application/json",
+        )
 
 
 def _thumb_blob_pathname(session_id: str, filename: str) -> str:
@@ -418,7 +430,7 @@ def _load_source_filename(session_id: str, sess: dict | None = None) -> str:
     if sess and sess.get("sourceFilename"):
         return str(sess["sourceFilename"])
     path = _session_dir(session_id) / "source_meta.json"
-    if not path.is_file() and _blob_enabled():
+    if not path.is_file() and _blob_session_enabled():
         data = _blob_get_bytes(f"sessions/{session_id}/source_meta.json", timeout=10.0)
         if data:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -440,7 +452,7 @@ def _load_source_bytes(session_id: str) -> tuple[bytes, str] | None:
         path = _session_dir(session_id) / f"source{ext}"
         if path.is_file():
             return path.read_bytes(), f"source{ext}"
-        if _blob_enabled():
+        if _blob_session_enabled():
             data = _blob_get_bytes(_source_blob_paths(session_id, ext), timeout=30.0)
             if data:
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -509,13 +521,43 @@ def _build_export_from_artifacts(session_id: str) -> bytes | None:
     return buf.getvalue()
 
 
+def _build_export_from_client_review(session_id: str, review_rows: dict) -> bytes | None:
+    """Build export from uploaded source + browser review snapshot (Tier B)."""
+    source = _load_source_bytes(session_id)
+    if not source:
+        return None
+    raw, name = source
+    df = _load_dataframe(raw, name)
+    rows = review_rows or {}
+    brand_names = [rows.get(str(i), {}).get("brandName", "") for i in range(len(df))]
+    adv_names = [rows.get(str(i), {}).get("advertiserName", "") for i in range(len(df))]
+    df["BRAND"] = brand_names
+    df["ADVERTISER_NAME"] = adv_names
+    faulty_values = [
+        bool(rows.get(str(i), {}).get("isFault", False)) for i in range(len(df))
+    ]
+    faulty_col = is_faulty_export_column(list(df.columns))
+    if faulty_col:
+        df[faulty_col] = faulty_values
+    else:
+        df["isFaulty"] = faulty_values
+    drop_legacy = [c for c in df.columns if str(c).strip().lower() == "isfault"]
+    if drop_legacy:
+        df = df.drop(columns=drop_legacy)
+    df["advertiserMatch"] = [rows.get(str(i), {}).get("advertiserMatch") for i in range(len(df))]
+    df["reviewed"] = [bool(rows.get(str(i), {}).get("reviewed", False)) for i in range(len(df))]
+    buf = BytesIO()
+    df.to_excel(buf, index=False)
+    return buf.getvalue()
+
+
 def _checkpoint_export(session_id: str, sess: dict, *, to_blob: bool = False) -> None:
     try:
         data = _build_export_bytes(sess)
         path = _export_checkpoint_path(session_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
-        if to_blob and _blob_enabled():
+        if to_blob and _blob_session_enabled():
             _blob_put_bytes(
                 f"sessions/{session_id}/export.xlsx",
                 data,
@@ -529,7 +571,7 @@ def _load_export_checkpoint(session_id: str) -> bytes | None:
     path = _export_checkpoint_path(session_id)
     if path.is_file() and path.stat().st_size > 0:
         return path.read_bytes()
-    if _blob_enabled():
+    if _blob_session_enabled():
         data = _blob_get_bytes(
             f"sessions/{session_id}/export.xlsx",
             timeout=30.0,
@@ -554,7 +596,7 @@ def _session_get(session_id: str) -> dict | None:
         sess = _sessions[session_id]
     else:
         path = SESSIONS_DIR / f"{session_id}.pkl"
-        if not path.is_file() and _blob_enabled():
+        if not path.is_file() and _blob_session_enabled():
             data = _blob_get_bytes(f"sessions/{session_id}.pkl", timeout=25.0)
             if data:
                 _ensure_data_dirs()
@@ -586,10 +628,8 @@ def _session_get(session_id: str) -> dict | None:
 def _session_put(session_id: str, sess: dict, *, full: bool = True) -> None:
     """Persist session state.
 
-    On Vercel, Blob puts are minimized:
-    - full=True (group swipe): pickle + review snapshot to Blob
-    - full=False (per-image toggle): local /tmp only — no Blob puts
-    - export.xlsx to Blob only when the user downloads (see export endpoint)
+    Review progress is stored in the browser (Tier B). Server keeps /tmp pickle for
+    export source merge. Blob puts only when YAMI_BLOB_SESSION=1.
     """
     _sessions[session_id] = sess
     if not _is_serverless():
@@ -604,8 +644,11 @@ def _session_put(session_id: str, sess: dict, *, full: bool = True) -> None:
         path = SESSIONS_DIR / f"{session_id}.pkl"
         data = pickle.dumps(sess, protocol=pickle.HIGHEST_PROTOCOL)
         path.write_bytes(data)
-        _blob_put_bytes(f"sessions/{session_id}.pkl", data, content_type="application/octet-stream")
-    _write_review_snapshot(session_id, sess, to_blob=full)
+        if _blob_session_enabled():
+            _blob_put_bytes(
+                f"sessions/{session_id}.pkl", data, content_type="application/octet-stream"
+            )
+    _write_review_snapshot(session_id, sess, to_blob=full and _blob_session_enabled())
     if full:
         try:
             _checkpoint_export(session_id, sess, to_blob=False)
@@ -959,8 +1002,10 @@ async def get_diagnostics():
     info["dataDir"] = str(DATA_DIR)
     info["dataDirWritable"] = DATA_DIR.exists() and os.access(DATA_DIR, os.W_OK)
     info["blobEnabled"] = _blob_enabled()
+    info["blobSessionEnabled"] = _blob_session_enabled()
     info["blobThumbsEnabled"] = _blob_thumbs_enabled()
     info["blobTokenPresent"] = bool(os.environ.get("BLOB_READ_WRITE_TOKEN"))
+    info["clientSideReview"] = True
     info["blobLibAvailable"] = True
     info["maxUploadBytes"] = MAX_UPLOAD_BYTES
     info["vercelPayloadLimit"] = _is_serverless()
@@ -1656,6 +1701,33 @@ async def review_item(session_id: str, body: dict):
     return {"ok": True, "cursor": sess["uncertain_cursor"]}
 
 
+@app.post("/api/session/{session_id}/export")
+async def export_xlsx_with_review(session_id: str, body: dict):
+    """Export annotated spreadsheet using browser-stored review state (Tier B)."""
+    review_rows = body.get("rows") or {}
+    if not review_rows:
+        raise HTTPException(400, "Review rows required — complete review in browser first.")
+
+    download_name = _export_download_name(session_id, _session_get(session_id))
+    sess = _session_get(session_id)
+    if sess:
+        try:
+            _merge_review_snapshot(sess, {"rows": review_rows})
+            data = await asyncio.to_thread(_build_export_bytes, sess)
+            return _export_file_response(data, download_name)
+        except Exception as exc:
+            logger.exception("Export from session failed %s: %s", session_id, exc)
+
+    data = await asyncio.to_thread(_build_export_from_client_review, session_id, review_rows)
+    if data:
+        return _export_file_response(data, download_name)
+
+    raise HTTPException(
+        404,
+        "Source file not found on server. Re-upload and export from the same browser session.",
+    )
+
+
 @app.get("/api/session/{session_id}/export")
 async def export_xlsx(session_id: str):
     sess = _session_get(session_id)
@@ -1665,7 +1737,9 @@ async def export_xlsx(session_id: str):
     if sess:
         try:
             data = await asyncio.to_thread(_build_export_bytes, sess)
-            await asyncio.to_thread(_checkpoint_export, session_id, sess, to_blob=True)
+            await asyncio.to_thread(
+                _checkpoint_export, session_id, sess, to_blob=_blob_session_enabled()
+            )
             return _export_file_response(data, download_name)
         except Exception as exc:
             logger.exception("Export from session failed %s: %s", session_id, exc)
@@ -1680,6 +1754,6 @@ async def export_xlsx(session_id: str):
     if not sess:
         raise HTTPException(
             404,
-            "Session not found. Your work may still be recoverable if you retry shortly.",
+            "Session not found. Export with POST and your browser review data instead.",
         )
     raise HTTPException(500, "Export failed — please try again.")

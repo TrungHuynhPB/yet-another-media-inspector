@@ -181,6 +181,13 @@ header h1 {
   color: var(--muted);
 }
 
+.review-status {
+  margin: 0.35rem 0 0.85rem;
+  text-align: center;
+  font-size: 0.85rem;
+  color: #f0a020;
+}
+
 .review-filename {
   margin: 0.1rem 0 1rem;
   text-align: center;

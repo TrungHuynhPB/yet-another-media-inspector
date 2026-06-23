@@ -79,8 +79,18 @@ const hintRight = $("hint-right");
 const btnFault = $("btn-fault");
 const btnOk = $("btn-ok");
 
+const REVIEW_STORE_PREFIX = "yami-review:";
+
 function setStatus(msg) {
   $("upload-status").textContent = msg;
+}
+
+function setReviewStatus(msg) {
+  const el = $("review-status");
+  if (!el) return;
+  const text = String(msg || "").trim();
+  el.textContent = text;
+  el.classList.toggle("hidden", !text);
 }
 
 function setFileSelectedName(name) {
@@ -211,6 +221,142 @@ function unavailableStepCount() {
 
 function totalReviewSteps() {
   return unavailableStepCount() + uncertainItems.length + brandGroups.length;
+}
+
+function loadReviewStore() {
+  if (!sessionId) return { sessionId: null, rows: {} };
+  try {
+    const raw = localStorage.getItem(REVIEW_STORE_PREFIX + sessionId);
+    if (!raw) return { sessionId, rows: {} };
+    return JSON.parse(raw);
+  } catch {
+    return { sessionId, rows: {} };
+  }
+}
+
+function saveReviewStore(store) {
+  if (!sessionId) return;
+  try {
+    localStorage.setItem(REVIEW_STORE_PREFIX + sessionId, JSON.stringify(store));
+  } catch (err) {
+    setReviewStatus(`Could not save review in browser: ${err.message || err}`);
+  }
+}
+
+function getRowState(rowIndex) {
+  const store = loadReviewStore();
+  return store.rows[String(rowIndex)] || null;
+}
+
+function setRowReviewState(rowIndex, patch) {
+  const store = loadReviewStore();
+  const key = String(rowIndex);
+  store.rows[key] = { ...(store.rows[key] || {}), ...patch };
+  saveReviewStore(store);
+}
+
+function initReviewStore(data) {
+  const rows = {};
+  const total = Number(data.totalRows) || 0;
+  for (let i = 0; i < total; i++) {
+    rows[String(i)] = {
+      isFault: false,
+      faultManual: false,
+      reviewed: false,
+      advertiserMatch: null,
+      brandName: "",
+      advertiserName: "",
+    };
+  }
+
+  function mergeItem(item) {
+    const idx = String(item.rowIndex);
+    const meta = item.metadata || {};
+    rows[idx] = {
+      ...rows[idx],
+      isFault: Boolean(item.isFault),
+      faultManual: Boolean(item.isFault),
+      brandName: meta.brand || rows[idx].brandName || "",
+      advertiserName: meta.advertiser_name || rows[idx].advertiserName || "",
+    };
+  }
+
+  for (const g of data.groups || []) {
+    for (const item of g.items || []) mergeItem(item);
+  }
+  for (const g of data.uncertain || []) {
+    for (const item of g.items || []) mergeItem(item);
+  }
+  for (const entry of data.unavailable?.entries || []) {
+    const idx = String(entry.rowIndex);
+    rows[idx] = {
+      ...rows[idx],
+      brandName: entry.brand || rows[idx].brandName || "",
+      advertiserName: entry.advertiserName || rows[idx].advertiserName || "",
+    };
+  }
+
+  saveReviewStore({ sessionId: data.sessionId, filename: uploadedFilename, rows });
+}
+
+function hydrateItemFromStore(item) {
+  const state = getRowState(item.rowIndex);
+  if (state) {
+    item.isFault = Boolean(state.isFault);
+  }
+  return item;
+}
+
+function applyReviewStoreToQueues() {
+  const hydrateGroup = (g) => {
+    if (!g?.items) return;
+    for (const item of g.items) hydrateItemFromStore(item);
+  };
+  for (const g of brandGroups) hydrateGroup(g);
+  for (const g of uncertainItems) hydrateGroup(g);
+}
+
+function applyUnavailableReview(isFault) {
+  for (const entry of unavailableMedia?.entries || []) {
+    setRowReviewState(entry.rowIndex, {
+      isFault,
+      faultManual: isFault,
+      reviewed: true,
+      advertiserMatch: !isFault,
+    });
+  }
+}
+
+function applyUncertainGroupReview(item, advertiserMatch) {
+  const indices = item.memberIndices?.length
+    ? item.memberIndices
+    : (item.items || []).map((i) => i.rowIndex);
+  for (const idx of indices) {
+    const existing = getRowState(idx) || {};
+    const manual = Boolean(existing.faultManual);
+    setRowReviewState(idx, {
+      reviewed: true,
+      advertiserMatch,
+      isFault: !advertiserMatch ? true : manual ? Boolean(existing.isFault) : false,
+      faultManual: manual,
+    });
+  }
+}
+
+function applyBrandGroupReview(item) {
+  const indices = item.memberIndices?.length
+    ? item.memberIndices
+    : (item.items || []).map((i) => i.rowIndex);
+  for (const idx of indices) {
+    const existing = getRowState(idx) || {};
+    const manual = Boolean(existing.faultManual);
+    setRowReviewState(idx, {
+      reviewed: true,
+      advertiserMatch: true,
+      isFault: manual ? Boolean(existing.isFault) : false,
+      faultManual: manual,
+    });
+  }
 }
 
 function renderUnavailableTable(session) {
@@ -515,28 +661,36 @@ function applyFaultUi(item, cell, isFault) {
 async function toggleImageFault(item, cell) {
   if (cell.dataset.toggling === "1") return;
   cell.dataset.toggling = "1";
-  const prevFault = Boolean(item.isFault);
-  const nextFault = !prevFault;
+  const nextFault = !Boolean(item.isFault);
   applyFaultUi(item, cell, nextFault);
+  setRowReviewState(item.rowIndex, {
+    isFault: nextFault,
+    faultManual: nextFault,
+  });
   updateGroupCountText();
-  try {
-    const res = await fetch(`/api/session/${sessionId}/toggle-fault`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ rowIndex: item.rowIndex, isFault: nextFault }),
-    });
-    const data = await parseJsonResponse(res);
-    if (!res.ok) throw new Error(data.detail || "Update failed");
+  setReviewStatus("");
+  delete cell.dataset.toggling;
+}
 
-    applyFaultUi(item, cell, Boolean(data.isFault));
-    updateGroupCountText();
-  } catch (err) {
-    applyFaultUi(item, cell, prevFault);
-    updateGroupCountText();
-    setStatus(err.message || String(err));
-  } finally {
-    delete cell.dataset.toggling;
+function markAllGridFaults() {
+  if (!isGridReviewMode() || reviewing) return;
+  const group = currentQueue()[cursor];
+  const items = group?.items || [];
+  if (!items.length) return;
+
+  for (const item of items) {
+    setRowReviewState(item.rowIndex, { isFault: true, faultManual: true });
+    item.isFault = true;
   }
+
+  for (const cell of cardGrid.querySelectorAll(".thumb-cell")) {
+    if (cell._item) applyFaultUi(cell._item, cell, true);
+  }
+  for (const item of gridAllItems) {
+    item.isFault = true;
+  }
+  updateGroupCountText();
+  setReviewStatus("");
 }
 
 function setUiForMode() {
@@ -552,19 +706,19 @@ function setUiForMode() {
     hintLeft.textContent = "← Mark all fault";
     hintRight.textContent = "Acknowledge →";
     btnFault.textContent = "✕ Mark all fault";
-    btnOk.textContent = "✓ Continue";
+    btnOk.textContent = "✓ Next";
     modeLabel.textContent = "Unavailable media — review table, then swipe";
   } else if (isUncertain) {
-    hintLeft.textContent = "← Flag all as Incorrect";
-    hintRight.textContent = "Correct brand (group) →";
-    btnFault.textContent = "✕ Flag all as Incorrect";
+    hintLeft.textContent = "← Incorrect brand (group)";
+    hintRight.textContent = "Correct brand →";
+    btnFault.textContent = "✕ Mark all on this page";
     btnOk.textContent = "✓ Correct brand";
     modeLabel.textContent =
       "Uncertain ads · grouped by brand (grid: tap ✕ fault, right-click inspect)";
   } else {
-    hintLeft.textContent = "← Fault (whole group)";
-    hintRight.textContent = "OK (whole group) →";
-    btnFault.textContent = "✕ Fault group";
+    hintLeft.textContent = "";
+    hintRight.textContent = "OK group →";
+    btnFault.textContent = "✕ Mark all on this page";
     btnOk.textContent = "✓ OK group";
     modeLabel.textContent = "Review brand groups";
   }
@@ -639,12 +793,17 @@ function showCard() {
     }
 
     const item = queue[cursor];
-    const items = item.items?.length ? item.items : [];
+    const items = (item.items?.length ? item.items : []).map((i) =>
+      hydrateItemFromStore({ ...i })
+    );
+    if (item.items?.length) {
+      item.items = items;
+    }
 
     const gridHint =
       items.length > GRID_BATCH_SIZE
-        ? "Scroll grid for more creatives · Tap ✕ fault · Right-click inspect · Swipe whole group"
-        : "Tap image to toggle ✕ fault · Right-click to inspect · Swipe for whole group";
+        ? "Scroll grid · Tap ✕ fault · Mark all on page · Right-click inspect · Swipe OK"
+        : "Tap image to toggle ✕ · Mark all on page · Right-click inspect · Swipe OK group";
     if (mode === "uncertain") {
       const reasonHint =
         item.reasonHint ||
@@ -1172,7 +1331,7 @@ function resetForNewUpload() {
   resetColumnConfig();
   uploadedFilename = "";
   setReviewFilename("");
-  setStatus("");
+  setReviewStatus("");
   doneSection.classList.add("hidden");
   reviewSection.classList.add("hidden");
   uploadSection.classList.remove("hidden");
@@ -1214,6 +1373,8 @@ async function submitReview(leftAction) {
   const queue = currentQueue();
   if (cursor >= queue.length) return;
 
+  if (mode === "brand" && leftAction) return;
+
   reviewing = true;
   setReviewWait(true);
   const item = queue[cursor];
@@ -1226,47 +1387,39 @@ async function submitReview(leftAction) {
 
   try {
     if (mode === "unavailable") {
-      await fetch(`/api/session/${sessionId}/review-unavailable`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ isFault: leftAction }),
-      });
+      applyUnavailableReview(leftAction);
     } else if (mode === "uncertain") {
-      await fetch(`/api/session/${sessionId}/review-uncertain`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          groupId: Number(item.groupId),
-          advertiserMatch: !leftAction,
-        }),
-      });
+      applyUncertainGroupReview(item, !leftAction);
     } else {
-      await fetch(`/api/session/${sessionId}/review`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ groupId: item.groupId, isFault: leftAction }),
-      });
+      applyBrandGroupReview(item);
     }
+    setReviewStatus("");
     cursor += 1;
     setTimeout(showCard, 220);
-  } catch {
+  } catch (err) {
     reviewing = false;
     setReviewWait(false);
     card.style.transform = "";
     card.style.opacity = "1";
     card.classList.remove("swipe-left", "swipe-right");
+    setReviewStatus(err.message || String(err));
   }
 }
 
 function exportResults() {
   if (!sessionId) return;
   if (!doneSection || doneSection.classList.contains("hidden")) {
-    setStatus("Export is available after review completes.");
+    setReviewStatus("Export is available after review completes.");
     return;
   }
   (async () => {
     try {
-      const res = await fetch(`/api/session/${sessionId}/export`);
+      const store = loadReviewStore();
+      const res = await fetch(`/api/session/${sessionId}/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rows: store.rows }),
+      });
       if (!res.ok) {
         const err = await parseJsonResponse(res).catch(() => ({}));
         throw new Error(err.detail || `Export failed (${res.status})`);
@@ -1287,9 +1440,9 @@ function exportResults() {
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
-      setStatus("Download started.");
+      setReviewStatus("Download started.");
     } catch (err) {
-      setStatus(err.message || String(err));
+      setReviewStatus(err.message || String(err));
     }
   })();
 }
@@ -1298,7 +1451,12 @@ document.addEventListener("keydown", (e) => {
   if (reviewSection.classList.contains("hidden") || reviewing) return;
   if (e.key === "ArrowLeft") {
     e.preventDefault();
-    submitReview(true);
+    if (isGridReviewMode()) {
+      if (mode === "uncertain") submitReview(true);
+      else markAllGridFaults();
+    } else {
+      submitReview(true);
+    }
   } else if (e.key === "ArrowRight") {
     e.preventDefault();
     submitReview(false);
@@ -1323,9 +1481,13 @@ function endSwipeGesture() {
   if (!dragging) return;
   dragging = false;
   const dx = currentX - startX;
-  if (dx < -80) submitReview(true);
-  else if (dx > 80) submitReview(false);
-  else {
+  if (mode === "brand") {
+    if (dx > 80) submitReview(false);
+  } else if (dx < -80) {
+    submitReview(true);
+  } else if (dx > 80) {
+    submitReview(false);
+  } else {
     card.style.transform = "";
     card.classList.remove("swipe-left", "swipe-right");
   }
@@ -1352,7 +1514,10 @@ function bindSwipeZones() {
 bindGridInteractions();
 bindSwipeZones();
 
-btnFault.addEventListener("click", () => submitReview(true));
+btnFault.addEventListener("click", () => {
+  if (isGridReviewMode()) markAllGridFaults();
+  else submitReview(true);
+});
 btnOk.addEventListener("click", () => submitReview(false));
 $("export-btn").addEventListener("click", exportResults);
 $("export-btn-done").addEventListener("click", exportResults);
@@ -1466,6 +1631,8 @@ $("upload-form").addEventListener("submit", async (e) => {
     brandGroups = data.groups || [];
     uncertainItems = normalizeUncertainItems(data.uncertain || []);
     unavailableMedia = data.unavailable || null;
+    initReviewStore(data);
+    applyReviewStoreToQueues();
     cursor = 0;
     mode = unavailableMedia
       ? "unavailable"
@@ -1483,6 +1650,7 @@ $("upload-form").addEventListener("submit", async (e) => {
       statusMsg += ` · Warning: ${warnings[0]}`;
     }
     setStatus(statusMsg);
+    setReviewStatus("Review saved in this browser. Export before clearing site data.");
     uploadSection.classList.add("hidden");
     reviewSection.classList.remove("hidden");
     doneSection.classList.add("hidden");
