@@ -77,6 +77,7 @@ const modeLabel = $("review-mode-label");
 const hintLeft = $("hint-left");
 const hintRight = $("hint-right");
 const btnFault = $("btn-fault");
+const btnMarkCorrect = $("btn-mark-correct");
 const btnOk = $("btn-ok");
 
 const REVIEW_STORE_PREFIX = "yami-review:";
@@ -217,6 +218,7 @@ function setReviewWait(show) {
   if (!el) return;
   el.classList.toggle("hidden", !show);
   btnFault.disabled = Boolean(show);
+  if (btnMarkCorrect) btnMarkCorrect.disabled = Boolean(show);
   btnOk.disabled = Boolean(show);
 }
 
@@ -1134,6 +1136,24 @@ function markAllGridFaults() {
   setReviewStatus("");
 }
 
+function markAllGridCorrect() {
+  if (!isGridReviewMode() || reviewing) return;
+  const group = currentQueue()[cursor];
+  const items = group?.items || [];
+  if (!items.length) return;
+
+  for (const item of items) {
+    setRowReviewState(item.rowIndex, { isFault: false, faultManual: false });
+    item.isFault = false;
+  }
+  for (const item of gridAllItems) {
+    item.isFault = false;
+  }
+  gridVirtual?.updateFaultStates();
+  updateGroupCountText();
+  setReviewStatus("");
+}
+
 function setUiForMode() {
   const isUnavailable = mode === "unavailable";
   const isUncertain = mode === "uncertain";
@@ -1149,19 +1169,24 @@ function setUiForMode() {
     btnFault.textContent = "✕ Mark all fault";
     btnOk.textContent = "✓ Next";
     modeLabel.textContent = "Unavailable media — review table, then swipe";
+    btnMarkCorrect?.classList.add("hidden");
   } else if (isUncertain) {
     hintLeft.textContent = "← Incorrect brand (group)";
     hintRight.textContent = "Correct brand →";
     btnFault.textContent = "✕ Mark all on this page";
+    btnMarkCorrect.textContent = "✓ Mark all as correct";
+    btnMarkCorrect?.classList.remove("hidden");
     btnOk.textContent = "✓ Correct brand";
     modeLabel.textContent =
       "Uncertain ads · grouped by brand (grid: tap ✕ fault, right-click inspect)";
   } else {
     hintLeft.textContent = "";
     hintRight.textContent = "Next →";
-    btnFault.textContent = "✕ Mark all Fault on this page";
+    btnFault.textContent = "✕ Mark all on this page";
+    btnMarkCorrect.textContent = "✓ Mark all as correct";
+    btnMarkCorrect?.classList.remove("hidden");
     btnOk.textContent = "✓ Next";
-    modeLabel.textContent = "Reviewing brand groups";
+    modeLabel.textContent = "Review brand groups";
   }
 }
 
@@ -1946,6 +1971,9 @@ bindSwipeZones();
 btnFault.addEventListener("click", () => {
   if (isGridReviewMode()) markAllGridFaults();
   else submitReview(true);
+});
+btnMarkCorrect?.addEventListener("click", () => {
+  if (isGridReviewMode()) markAllGridCorrect();
 });
 btnOk.addEventListener("click", () => submitReview(false));
 $("export-btn").addEventListener("click", exportResults);
