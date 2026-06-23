@@ -80,6 +80,9 @@ const btnFault = $("btn-fault");
 const btnOk = $("btn-ok");
 
 const REVIEW_STORE_PREFIX = "yami-review:";
+const SOURCE_DB_NAME = "yami-source";
+const SOURCE_STORE = "sources";
+const SOURCE_DB_VERSION = 1;
 
 function setStatus(msg) {
   $("upload-status").textContent = msg;
@@ -87,6 +90,14 @@ function setStatus(msg) {
 
 function setReviewStatus(msg) {
   const el = $("review-status");
+  if (!el) return;
+  const text = String(msg || "").trim();
+  el.textContent = text;
+  el.classList.toggle("hidden", !text);
+}
+
+function setDoneExportStatus(msg) {
+  const el = $("done-export-status");
   if (!el) return;
   const text = String(msg || "").trim();
   el.textContent = text;
@@ -299,6 +310,178 @@ function initReviewStore(data) {
   saveReviewStore({ sessionId: data.sessionId, filename: uploadedFilename, rows });
 }
 
+function openSourceDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(SOURCE_DB_NAME, SOURCE_DB_VERSION);
+    req.onerror = () => reject(req.error || new Error("IndexedDB unavailable"));
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(SOURCE_STORE)) {
+        db.createObjectStore(SOURCE_STORE, { keyPath: "sessionId" });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+  });
+}
+
+function detectFaultyExportColumn(headers) {
+  const lower = headers.map((h) => String(h || "").trim().toLowerCase());
+  for (const key of ["isfaulty", "is_faulty"]) {
+    const i = lower.indexOf(key);
+    if (i >= 0) return headers[i];
+  }
+  return null;
+}
+
+function classifiedExportFilename(originalFilename) {
+  const name = String(originalFilename || "upload.xlsx").trim() || "upload.xlsx";
+  const m = name.match(/^(.+?)(\.[^.]+)?$/);
+  if (!m) return "upload_Classified.xlsx";
+  let stem = m[1];
+  const ext = m[2] || ".xlsx";
+  if (stem.endsWith("_Classified")) return `${stem}.xlsx`;
+  return `${stem}_Classified.xlsx`;
+}
+
+async function readUploadWorkbook(file) {
+  const buf = await file.arrayBuffer();
+  const name = (file.name || "").toLowerCase();
+
+  if (name.endsWith(".json")) {
+    const text = new TextDecoder("utf-8").decode(buf);
+    const payload = JSON.parse(text);
+    const rows = Array.isArray(payload)
+      ? payload
+      : payload.rows || payload.data || [payload];
+    const ws = XLSX.utils.json_to_sheet(rows);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Sheet1");
+    return wb;
+  }
+
+  if (name.endsWith(".csv") || name.endsWith(".txt")) {
+    const text = new TextDecoder("utf-8").decode(buf);
+    return XLSX.read(text, { type: "string" });
+  }
+
+  return XLSX.read(new Uint8Array(buf), { type: "array" });
+}
+
+async function parseSourceSnapshot(file, urlColumn, brandColumn) {
+  if (typeof XLSX === "undefined") {
+    throw new Error("Export library failed to load — refresh the page.");
+  }
+  const wb = await readUploadWorkbook(file);
+  const sheetName = wb.SheetNames[0];
+  const ws = wb.Sheets[sheetName];
+  const aoa = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+  if (!aoa.length) throw new Error("Spreadsheet is empty.");
+
+  const headers = (aoa[0] || []).map((h) => String(h ?? ""));
+  const rows = aoa.slice(1).map((row) => {
+    const out = headers.map((_, ci) => {
+      const v = row?.[ci];
+      if (v == null) return "";
+      return v;
+    });
+    return out;
+  });
+
+  return {
+    filename: file.name || "upload.xlsx",
+    urlColumn,
+    brandColumn,
+    faultyColumn: detectFaultyExportColumn(headers),
+    headers,
+    rows,
+  };
+}
+
+async function saveSourceSnapshot(sessionId, snapshot) {
+  const db = await openSourceDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(SOURCE_STORE, "readwrite");
+    tx.objectStore(SOURCE_STORE).put({ ...snapshot, sessionId, savedAt: Date.now() });
+    tx.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    tx.onerror = () => {
+      db.close();
+      reject(tx.error || new Error("Could not save source file in browser"));
+    };
+  });
+}
+
+async function loadSourceSnapshot(sessionId) {
+  const db = await openSourceDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(SOURCE_STORE, "readonly");
+    const req = tx.objectStore(SOURCE_STORE).get(sessionId);
+    req.onsuccess = () => {
+      db.close();
+      resolve(req.result || null);
+    };
+    req.onerror = () => {
+      db.close();
+      reject(req.error || new Error("Could not read source file from browser"));
+    };
+  });
+}
+
+function buildClientExportWorkbook(sourceSnap, reviewRows) {
+  const headers = [...sourceSnap.headers];
+  const rows = sourceSnap.rows.map((r) => [...r]);
+
+  let faultyIdx = sourceSnap.faultyColumn
+    ? headers.indexOf(sourceSnap.faultyColumn)
+    : -1;
+  if (faultyIdx < 0) {
+    headers.push("isFaulty");
+    faultyIdx = headers.length - 1;
+    for (const row of rows) row.push("");
+  }
+
+  const extraCols = ["advertiserMatch", "reviewed"];
+  const extraIdx = {};
+  for (const col of extraCols) {
+    let idx = headers.indexOf(col);
+    if (idx < 0) {
+      headers.push(col);
+      idx = headers.length - 1;
+      for (const row of rows) row.push("");
+    }
+    extraIdx[col] = idx;
+  }
+
+  for (let i = 0; i < rows.length; i += 1) {
+    const state = reviewRows[String(i)] || {};
+    rows[i][faultyIdx] = Boolean(state.isFault);
+    rows[i][extraIdx.advertiserMatch] =
+      state.advertiserMatch == null ? "" : state.advertiserMatch;
+    rows[i][extraIdx.reviewed] = Boolean(state.reviewed);
+  }
+
+  const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Results");
+  return wb;
+}
+
+async function exportResultsClient() {
+  if (!sessionId) throw new Error("No active session.");
+  const sourceSnap = await loadSourceSnapshot(sessionId);
+  if (!sourceSnap?.headers?.length) {
+    throw new Error(
+      "Source file not found in this browser. Re-upload the same file, then export again."
+    );
+  }
+  const review = loadReviewStore();
+  const wb = buildClientExportWorkbook(sourceSnap, review.rows || {});
+  const filename = classifiedExportFilename(sourceSnap.filename || uploadedFilename);
+  XLSX.writeFile(wb, filename);
+}
+
 function hydrateItemFromStore(item) {
   const state = getRowState(item.rowIndex);
   if (state) {
@@ -500,12 +683,16 @@ function isGridReviewMode() {
 
 const GRID_MIN_CELL_PX = 200;
 const GRID_GAP_PX = 12;
-const GRID_OVERSCAN_ROWS = 2;
-const GRID_MAX_IMAGE_LOADS = 6;
+const GRID_OVERSCAN_ROWS = 4;
+const GRID_MAX_IMAGE_LOADS = 8;
+const GRID_SCROLL_DEBOUNCE_MS = 120;
 const GRID_LARGE_GROUP = 48;
 
 let gridAllItems = [];
 let gridVirtual = null;
+
+/** url → { status: "ok"|"fail", src } */
+const thumbImageCache = new Map();
 
 function getGridMetrics(container) {
   const style = getComputedStyle(container);
@@ -520,15 +707,57 @@ function getGridMetrics(container) {
   return { columns, cellWidth, rowHeight };
 }
 
+function isTikTokPageUrl(url) {
+  const u = String(url || "").toLowerCase();
+  if (!u.includes("tiktok.com")) return false;
+  if (u.includes("tiktokcdn") || u.includes("tiktokv.com")) return false;
+  return true;
+}
+
+function isImageLoadableUrl(url) {
+  if (!url) return false;
+  if (isTikTokPageUrl(url)) return false;
+  if (isVideoUrl(url) && !/\.(jpe?g|png|gif|webp)(\?|$)/i.test(url)) return false;
+  return true;
+}
+
+function applyThumbFromCache(cell) {
+  const img = cell._img;
+  if (!img) return false;
+  for (const src of cell._sources || []) {
+    const cached = thumbImageCache.get(src);
+    if (cached?.status === "ok") {
+      img.src = cached.src;
+      img.classList.add("loaded");
+      cell._imgLoaded = true;
+      cell.classList.remove("thumb-load-failed", "thumb-tiktok-placeholder");
+      return true;
+    }
+  }
+  return false;
+}
+
+function showThumbPlaceholder(cell) {
+  const mediaUrl = cell._item?.mediaUrl || cell._item?.thumbUrl || "";
+  cell.classList.remove("thumb-load-failed", "thumb-tiktok-placeholder");
+  if (isTikTokPageUrl(mediaUrl)) {
+    cell.classList.add("thumb-tiktok-placeholder");
+  } else {
+    cell.classList.add("thumb-load-failed");
+  }
+}
+
 const thumbImageQueue = (() => {
   let active = 0;
   const waiting = [];
 
   function pump() {
+    waiting.sort((a, b) => (a._queuePriority ?? 0) - (b._queuePriority ?? 0));
     while (active < GRID_MAX_IMAGE_LOADS && waiting.length) {
       const cell = waiting.shift();
       if (!cell?.isConnected) continue;
       if (cell._imgLoaded || cell._imgLoading) continue;
+      if (applyThumbFromCache(cell)) continue;
       active += 1;
       cell._imgLoading = true;
       loadThumbImage(cell, () => {
@@ -540,23 +769,17 @@ const thumbImageQueue = (() => {
   }
 
   return {
-    enqueue(cell) {
-      if (cell._imgLoaded || cell._imgLoading) return;
+    enqueue(cell, priority = 0) {
+      if (cell._imgLoaded) return;
+      if (applyThumbFromCache(cell)) return;
+      cell._queuePriority = priority;
       if (!waiting.includes(cell)) waiting.push(cell);
       pump();
     },
-    cancel(cell) {
+    detach(cell) {
       const idx = waiting.indexOf(cell);
       if (idx >= 0) waiting.splice(idx, 1);
-      cell._imgLoading = false;
-      cell._imgLoaded = false;
-      if (cell._img) {
-        cell._img.removeAttribute("src");
-        cell._img.onload = null;
-        cell._img.onerror = null;
-        cell._img.classList.remove("loaded");
-      }
-      cell.classList.remove("thumb-load-failed");
+      // In-flight loads continue and populate thumbImageCache.
     },
     reset() {
       waiting.length = 0;
@@ -566,18 +789,16 @@ const thumbImageQueue = (() => {
 })();
 
 function loadThumbImage(cell, onDone) {
-  if (!cell.isConnected) {
-    onDone();
-    return;
-  }
   const img = cell._img;
-  const sources = (cell._sources || []).filter(Boolean);
+  const sources = (cell._sources || []).filter(isImageLoadableUrl);
   if (!img || !sources.length) {
+    if (cell.isConnected) showThumbPlaceholder(cell);
     onDone();
     return;
   }
 
   let attempt = 0;
+
   const finish = () => {
     img.onload = null;
     img.onerror = null;
@@ -585,28 +806,44 @@ function loadThumbImage(cell, onDone) {
   };
 
   const tryNext = () => {
-    if (!cell.isConnected) {
-      finish();
-      return;
-    }
     if (attempt >= sources.length) {
-      cell.classList.add("thumb-load-failed");
+      for (const s of sources) {
+        if (!thumbImageCache.has(s)) thumbImageCache.set(s, { status: "fail" });
+      }
+      if (cell.isConnected) showThumbPlaceholder(cell);
       finish();
       return;
     }
     const src = sources[attempt];
     attempt += 1;
-    img.onload = () => {
-      if (!cell.isConnected) {
-        finish();
-        return;
+
+    const cached = thumbImageCache.get(src);
+    if (cached?.status === "ok") {
+      if (cell.isConnected) {
+        img.src = cached.src;
+        img.classList.add("loaded");
+        cell._imgLoaded = true;
+        cell.classList.remove("thumb-load-failed", "thumb-tiktok-placeholder");
       }
-      img.classList.add("loaded");
-      cell._imgLoaded = true;
-      cell.classList.remove("thumb-load-failed");
+      finish();
+      return;
+    }
+    if (cached?.status === "fail") {
+      tryNext();
+      return;
+    }
+
+    img.onload = () => {
+      thumbImageCache.set(src, { status: "ok", src });
+      if (cell.isConnected) {
+        img.classList.add("loaded");
+        cell._imgLoaded = true;
+        cell.classList.remove("thumb-load-failed", "thumb-tiktok-placeholder");
+      }
       finish();
     };
     img.onerror = () => {
+      thumbImageCache.set(src, { status: "fail" });
       tryNext();
     };
     img.src = src;
@@ -624,13 +861,20 @@ function thumbSourcesForItem(item) {
       ? adclarityPosterFromMp4(mediaUrl)
       : "";
   const ytThumbs = isYoutubeUrl(mediaUrl) ? youtubeThumbCandidates(mediaUrl) : [];
-  return [
+  const raw = [
     thumbUrl,
     derivedPoster,
     derivedPoster ? adclarityJpgFromJpeg(derivedPoster) : "",
     ...ytThumbs,
-    mediaUrl,
-  ].filter(Boolean);
+  ];
+  const seen = new Set();
+  const out = [];
+  for (const u of raw) {
+    if (!u || !isImageLoadableUrl(u) || seen.has(u)) continue;
+    seen.add(u);
+    out.push(u);
+  }
+  return out;
 }
 
 function destroyVirtualGrid() {
@@ -662,6 +906,7 @@ function createVirtualGrid(container, items) {
 
   const mounted = new Map();
   let raf = null;
+  let scrollDebounceTimer = null;
 
   function layout() {
     const metrics = getGridMetrics(container);
@@ -673,6 +918,7 @@ function createVirtualGrid(container, items) {
     const totalRows = Math.ceil(gridAllItems.length / columns);
     const scrollTop = container.scrollTop;
     const viewH = container.clientHeight || rowHeight * 3;
+    const viewCenterY = scrollTop + viewH / 2;
 
     const startRow = Math.max(0, Math.floor(scrollTop / rowHeight) - GRID_OVERSCAN_ROWS);
     const endRow = Math.min(
@@ -694,7 +940,7 @@ function createVirtualGrid(container, items) {
 
     for (const [idx, cell] of mounted) {
       if (idx < startIndex || idx >= endIndex) {
-        thumbImageQueue.cancel(cell);
+        thumbImageQueue.detach(cell);
         cell.remove();
         mounted.delete(idx);
       }
@@ -706,37 +952,55 @@ function createVirtualGrid(container, items) {
       cell.dataset.virtualIndex = String(i);
       cellsEl.appendChild(cell);
       mounted.set(i, cell);
-      thumbImageQueue.enqueue(cell);
+      const cellRow = Math.floor(i / columns);
+      const cellCenterY = cellRow * rowHeight + rowHeight / 2;
+      const priority = Math.abs(cellCenterY - viewCenterY);
+      thumbImageQueue.enqueue(cell, priority);
     }
   }
 
-  function scheduleLayout() {
-    if (raf) return;
+  function runLayout() {
+    if (raf) cancelAnimationFrame(raf);
     raf = requestAnimationFrame(() => {
       raf = null;
       layout();
     });
   }
 
-  const onScroll = () => scheduleLayout();
-  const ro = new ResizeObserver(() => scheduleLayout());
+  function scheduleLayout(immediate = false) {
+    if (immediate) {
+      clearTimeout(scrollDebounceTimer);
+      scrollDebounceTimer = null;
+      runLayout();
+      return;
+    }
+    clearTimeout(scrollDebounceTimer);
+    scrollDebounceTimer = setTimeout(() => {
+      scrollDebounceTimer = null;
+      runLayout();
+    }, GRID_SCROLL_DEBOUNCE_MS);
+  }
+
+  const onScroll = () => scheduleLayout(false);
+  const ro = new ResizeObserver(() => scheduleLayout(true));
 
   container.addEventListener("scroll", onScroll, { passive: true });
   ro.observe(container);
-  layout();
+  scheduleLayout(true);
 
   gridVirtual = {
-    refresh: scheduleLayout,
+    refresh: () => scheduleLayout(true),
     updateFaultStates() {
       for (const cell of mounted.values()) {
         if (cell._item) applyFaultUi(cell._item, cell, Boolean(cell._item.isFault));
       }
     },
     destroy() {
+      clearTimeout(scrollDebounceTimer);
       if (raf) cancelAnimationFrame(raf);
       container.removeEventListener("scroll", onScroll);
       ro.disconnect();
-      for (const cell of mounted.values()) thumbImageQueue.cancel(cell);
+      for (const cell of mounted.values()) thumbImageQueue.detach(cell);
       mounted.clear();
       thumbImageQueue.reset();
     },
@@ -760,10 +1024,6 @@ function createThumbCell(item, options = {}) {
   cell._imgLoaded = false;
   cell._imgLoading = false;
 
-  if (!options.deferLoad && sources.length) {
-    loadThumbImage(cell, () => {});
-  }
-
   const overlay = document.createElement("div");
   overlay.className = "fault-overlay";
   overlay.innerHTML = '<span class="fault-x" aria-hidden="true">✕</span>';
@@ -772,6 +1032,17 @@ function createThumbCell(item, options = {}) {
   cell.appendChild(overlay);
   cell._item = item;
   applyFaultUi(item, cell, Boolean(item.isFault));
+
+  if (!options.deferLoad) {
+    if (applyThumbFromCache(cell)) {
+      /* cached */
+    } else if (sources.length) {
+      loadThumbImage(cell, () => {});
+    } else {
+      showThumbPlaceholder(cell);
+    }
+  }
+
   return cell;
 }
 
@@ -1017,6 +1288,7 @@ function finishReview() {
   reviewSection.classList.add("hidden");
   doneSection.classList.remove("hidden");
   $("export-btn")?.classList.add("hidden");
+  setDoneExportStatus("");
 }
 
 function showLoading(show) {
@@ -1503,6 +1775,7 @@ function resetForNewUpload() {
   uploadedFilename = "";
   setReviewFilename("");
   setReviewStatus("");
+  setDoneExportStatus("");
   doneSection.classList.add("hidden");
   reviewSection.classList.add("hidden");
   uploadSection.classList.remove("hidden");
@@ -1583,37 +1856,22 @@ function exportResults() {
     setReviewStatus("Export is available after review completes.");
     return;
   }
+
+  const btnDone = $("export-btn-done");
+  const btnReview = $("export-btn");
+  if (btnDone) btnDone.disabled = true;
+  if (btnReview) btnReview.disabled = true;
+  setDoneExportStatus("Building export…");
+
   (async () => {
     try {
-      const store = loadReviewStore();
-      const res = await fetch(`/api/session/${sessionId}/export`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ rows: store.rows }),
-      });
-      if (!res.ok) {
-        const err = await parseJsonResponse(res).catch(() => ({}));
-        throw new Error(err.detail || `Export failed (${res.status})`);
-      }
-      const blob = await res.blob();
-      if (!blob.size) {
-        throw new Error("Export returned an empty file");
-      }
-      let filename = "media_inspector_output.xlsx";
-      const disp = res.headers.get("Content-Disposition") || "";
-      const m = /filename="?([^";\n]+)"?/i.exec(disp);
-      if (m) filename = m[1].trim();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-      setReviewStatus("Download started.");
+      await exportResultsClient();
+      setDoneExportStatus("Download started.");
     } catch (err) {
-      setReviewStatus(err.message || String(err));
+      setDoneExportStatus(err.message || String(err));
+    } finally {
+      if (btnDone) btnDone.disabled = false;
+      if (btnReview) btnReview.disabled = false;
     }
   })();
 }
@@ -1790,15 +2048,30 @@ $("upload-form").addEventListener("submit", async (e) => {
   }
 
   const fd = new FormData();
-  fd.append("file", fileInput.files[0]);
+  const file = fileInput.files[0];
+  fd.append("file", file);
   fd.append("url_column", urlCol.value);
   fd.append("brand_column", brandCol.value);
   fd.append("k_groups", "0");
 
   try {
+    let sourceSnapshot;
+    try {
+      sourceSnapshot = await parseSourceSnapshot(file, urlCol.value, brandCol.value);
+    } catch (parseErr) {
+      throw new Error(parseErr.message || "Could not read spreadsheet in browser.");
+    }
+
     const data = await uploadFile(fd);
 
     sessionId = data.sessionId;
+    let exportCacheWarn = "";
+    try {
+      await saveSourceSnapshot(sessionId, sourceSnapshot);
+    } catch (saveErr) {
+      console.warn("Source snapshot save failed:", saveErr);
+      exportCacheWarn = " · Could not cache file for export in this browser.";
+    }
     brandGroups = data.groups || [];
     uncertainItems = normalizeUncertainItems(data.uncertain || []);
     unavailableMedia = data.unavailable || null;
@@ -1821,7 +2094,9 @@ $("upload-form").addEventListener("submit", async (e) => {
       statusMsg += ` · Warning: ${warnings[0]}`;
     }
     setStatus(statusMsg);
-    setReviewStatus("Review saved in this browser. Export before clearing site data.");
+    setReviewStatus(
+      "Review saved in this browser. Export works offline — no server needed." + exportCacheWarn
+    );
     uploadSection.classList.add("hidden");
     reviewSection.classList.remove("hidden");
     doneSection.classList.add("hidden");

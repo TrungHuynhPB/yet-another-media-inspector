@@ -385,7 +385,8 @@ header h1 {
 }
 
 .thumb-cell:has(img.loaded)::before,
-.thumb-cell.thumb-load-failed::before {
+.thumb-cell.thumb-load-failed::before,
+.thumb-cell.thumb-tiktok-placeholder::before {
   animation: none;
   opacity: 0;
 }
@@ -426,6 +427,42 @@ header h1 {
   font-size: 2rem;
   color: var(--muted);
   pointer-events: none;
+}
+
+.thumb-cell.thumb-tiktok-placeholder::after {
+  content: "TikTok";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.85rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: #e8e8ec;
+  pointer-events: none;
+}
+
+/* Fault on unloaded cells: corner badge instead of full red wash */
+.thumb-cell.is-fault:not(:has(img.loaded)) .fault-overlay {
+  background: transparent;
+  opacity: 1;
+  align-items: flex-start;
+  justify-content: flex-end;
+  padding: 6px;
+}
+
+.thumb-cell.is-fault:not(:has(img.loaded)) .fault-x {
+  font-size: 1.25rem;
+  width: 1.75rem;
+  height: 1.75rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  background: rgba(40, 40, 48, 0.88);
+  border: 2px solid var(--fault);
 }
 
 @keyframes thumb-shimmer {
@@ -659,6 +696,18 @@ header h1 {
   color: var(--muted);
   margin-bottom: 1.5rem;
   font-size: 0.9rem;
+}
+
+.done-export-status {
+  margin: 0 0 1rem;
+  font-size: 0.9rem;
+  color: #f0a020;
+  min-height: 1.25rem;
+}
+
+.export-btn:disabled {
+  opacity: 0.55;
+  cursor: wait;
 }
 
 /* Loading overlay */
