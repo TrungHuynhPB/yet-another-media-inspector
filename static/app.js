@@ -498,28 +498,125 @@ function isGridReviewMode() {
   return mode === "uncertain" || mode === "brand";
 }
 
-const GRID_BATCH_SIZE = 48;
-let gridAllItems = [];
-let gridLoadObserver = null;
+const GRID_MIN_CELL_PX = 200;
+const GRID_GAP_PX = 12;
+const GRID_OVERSCAN_ROWS = 2;
+const GRID_MAX_IMAGE_LOADS = 6;
+const GRID_LARGE_GROUP = 48;
 
-function disconnectGridInfiniteScroll() {
-  if (gridLoadObserver) {
-    gridLoadObserver.disconnect();
-    gridLoadObserver = null;
-  }
+let gridAllItems = [];
+let gridVirtual = null;
+
+function getGridMetrics(container) {
+  const style = getComputedStyle(container);
+  const paddingX = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+  const innerW = Math.max(0, container.clientWidth - paddingX);
+  const columns = Math.max(
+    1,
+    Math.floor((innerW + GRID_GAP_PX) / (GRID_MIN_CELL_PX + GRID_GAP_PX))
+  );
+  const cellWidth = (innerW - (columns - 1) * GRID_GAP_PX) / columns;
+  const rowHeight = cellWidth + GRID_GAP_PX;
+  return { columns, cellWidth, rowHeight };
 }
 
-function createThumbCell(item) {
-  const cell = document.createElement("button");
-  cell.type = "button";
-  cell.className = "thumb-cell";
-  cell.dataset.rowIndex = String(item.rowIndex);
+const thumbImageQueue = (() => {
+  let active = 0;
+  const waiting = [];
 
-  const img = document.createElement("img");
-  img.alt = "Creative";
-  img.loading = "lazy";
-  img.draggable = false;
-  img.referrerPolicy = "no-referrer";
+  function pump() {
+    while (active < GRID_MAX_IMAGE_LOADS && waiting.length) {
+      const cell = waiting.shift();
+      if (!cell?.isConnected) continue;
+      if (cell._imgLoaded || cell._imgLoading) continue;
+      active += 1;
+      cell._imgLoading = true;
+      loadThumbImage(cell, () => {
+        active -= 1;
+        cell._imgLoading = false;
+        pump();
+      });
+    }
+  }
+
+  return {
+    enqueue(cell) {
+      if (cell._imgLoaded || cell._imgLoading) return;
+      if (!waiting.includes(cell)) waiting.push(cell);
+      pump();
+    },
+    cancel(cell) {
+      const idx = waiting.indexOf(cell);
+      if (idx >= 0) waiting.splice(idx, 1);
+      cell._imgLoading = false;
+      cell._imgLoaded = false;
+      if (cell._img) {
+        cell._img.removeAttribute("src");
+        cell._img.onload = null;
+        cell._img.onerror = null;
+        cell._img.classList.remove("loaded");
+      }
+      cell.classList.remove("thumb-load-failed");
+    },
+    reset() {
+      waiting.length = 0;
+      active = 0;
+    },
+  };
+})();
+
+function loadThumbImage(cell, onDone) {
+  if (!cell.isConnected) {
+    onDone();
+    return;
+  }
+  const img = cell._img;
+  const sources = (cell._sources || []).filter(Boolean);
+  if (!img || !sources.length) {
+    onDone();
+    return;
+  }
+
+  let attempt = 0;
+  const finish = () => {
+    img.onload = null;
+    img.onerror = null;
+    onDone();
+  };
+
+  const tryNext = () => {
+    if (!cell.isConnected) {
+      finish();
+      return;
+    }
+    if (attempt >= sources.length) {
+      cell.classList.add("thumb-load-failed");
+      finish();
+      return;
+    }
+    const src = sources[attempt];
+    attempt += 1;
+    img.onload = () => {
+      if (!cell.isConnected) {
+        finish();
+        return;
+      }
+      img.classList.add("loaded");
+      cell._imgLoaded = true;
+      cell.classList.remove("thumb-load-failed");
+      finish();
+    };
+    img.onerror = () => {
+      tryNext();
+    };
+    img.src = src;
+    if (img.complete && img.naturalWidth > 0) img.onload();
+  };
+
+  tryNext();
+}
+
+function thumbSourcesForItem(item) {
   const mediaUrl = item.mediaUrl || item.thumbUrl;
   const thumbUrl = item.thumbUrl;
   const derivedPoster =
@@ -527,13 +624,145 @@ function createThumbCell(item) {
       ? adclarityPosterFromMp4(mediaUrl)
       : "";
   const ytThumbs = isYoutubeUrl(mediaUrl) ? youtubeThumbCandidates(mediaUrl) : [];
-  setImgSrcWithFallback(img, [
+  return [
     thumbUrl,
     derivedPoster,
     derivedPoster ? adclarityJpgFromJpeg(derivedPoster) : "",
     ...ytThumbs,
     mediaUrl,
-  ]);
+  ].filter(Boolean);
+}
+
+function destroyVirtualGrid() {
+  if (!gridVirtual) return;
+  gridVirtual.destroy();
+  gridVirtual = null;
+}
+
+function createVirtualGrid(container, items) {
+  destroyVirtualGrid();
+  thumbImageQueue.reset();
+  gridAllItems = items || [];
+  container.innerHTML = "";
+  container.scrollTop = 0;
+  if (!gridAllItems.length) return;
+
+  const topSpacer = document.createElement("div");
+  topSpacer.className = "grid-virtual-spacer";
+  topSpacer.setAttribute("aria-hidden", "true");
+  const cellsEl = document.createElement("div");
+  cellsEl.className = "grid-virtual-cells";
+  const bottomSpacer = document.createElement("div");
+  bottomSpacer.className = "grid-virtual-spacer";
+  bottomSpacer.setAttribute("aria-hidden", "true");
+
+  container.appendChild(topSpacer);
+  container.appendChild(cellsEl);
+  container.appendChild(bottomSpacer);
+
+  const mounted = new Map();
+  let raf = null;
+
+  function layout() {
+    const metrics = getGridMetrics(container);
+    const columns = metrics.columns;
+    let { rowHeight } = metrics;
+    if (!rowHeight || rowHeight <= 0) {
+      rowHeight = GRID_MIN_CELL_PX + GRID_GAP_PX;
+    }
+    const totalRows = Math.ceil(gridAllItems.length / columns);
+    const scrollTop = container.scrollTop;
+    const viewH = container.clientHeight || rowHeight * 3;
+
+    const startRow = Math.max(0, Math.floor(scrollTop / rowHeight) - GRID_OVERSCAN_ROWS);
+    const endRow = Math.min(
+      totalRows,
+      Math.max(
+        startRow + 1,
+        Math.ceil((scrollTop + viewH) / rowHeight) + GRID_OVERSCAN_ROWS
+      )
+    );
+
+    const startIndex = startRow * columns;
+    const endIndex = Math.min(gridAllItems.length, endRow * columns);
+
+    topSpacer.style.height = `${startRow * rowHeight}px`;
+    bottomSpacer.style.height = `${Math.max(0, (totalRows - endRow) * rowHeight)}px`;
+
+    cellsEl.style.gridTemplateColumns = `repeat(${columns}, 1fr)`;
+    cellsEl.style.gap = `${GRID_GAP_PX}px`;
+
+    for (const [idx, cell] of mounted) {
+      if (idx < startIndex || idx >= endIndex) {
+        thumbImageQueue.cancel(cell);
+        cell.remove();
+        mounted.delete(idx);
+      }
+    }
+
+    for (let i = startIndex; i < endIndex; i += 1) {
+      if (mounted.has(i)) continue;
+      const cell = createThumbCell(gridAllItems[i], { deferLoad: true });
+      cell.dataset.virtualIndex = String(i);
+      cellsEl.appendChild(cell);
+      mounted.set(i, cell);
+      thumbImageQueue.enqueue(cell);
+    }
+  }
+
+  function scheduleLayout() {
+    if (raf) return;
+    raf = requestAnimationFrame(() => {
+      raf = null;
+      layout();
+    });
+  }
+
+  const onScroll = () => scheduleLayout();
+  const ro = new ResizeObserver(() => scheduleLayout());
+
+  container.addEventListener("scroll", onScroll, { passive: true });
+  ro.observe(container);
+  layout();
+
+  gridVirtual = {
+    refresh: scheduleLayout,
+    updateFaultStates() {
+      for (const cell of mounted.values()) {
+        if (cell._item) applyFaultUi(cell._item, cell, Boolean(cell._item.isFault));
+      }
+    },
+    destroy() {
+      if (raf) cancelAnimationFrame(raf);
+      container.removeEventListener("scroll", onScroll);
+      ro.disconnect();
+      for (const cell of mounted.values()) thumbImageQueue.cancel(cell);
+      mounted.clear();
+      thumbImageQueue.reset();
+    },
+  };
+}
+
+function createThumbCell(item, options = {}) {
+  const cell = document.createElement("button");
+  cell.type = "button";
+  cell.className = "thumb-cell";
+  cell.dataset.rowIndex = String(item.rowIndex);
+
+  const img = document.createElement("img");
+  img.alt = "Creative";
+  img.draggable = false;
+  img.referrerPolicy = "no-referrer";
+
+  const sources = thumbSourcesForItem(item);
+  cell._sources = sources;
+  cell._img = img;
+  cell._imgLoaded = false;
+  cell._imgLoading = false;
+
+  if (!options.deferLoad && sources.length) {
+    loadThumbImage(cell, () => {});
+  }
 
   const overlay = document.createElement("div");
   overlay.className = "fault-overlay";
@@ -544,48 +773,6 @@ function createThumbCell(item) {
   cell._item = item;
   applyFaultUi(item, cell, Boolean(item.isFault));
   return cell;
-}
-
-function appendGridBatch(container) {
-  const sentinel = container.querySelector(".grid-scroll-sentinel");
-  if (!sentinel) return;
-
-  const rendered = parseInt(container.dataset.renderedCount || "0", 10);
-  if (rendered >= gridAllItems.length) return;
-
-  const batch = gridAllItems.slice(rendered, rendered + GRID_BATCH_SIZE);
-  for (const item of batch) {
-    container.insertBefore(createThumbCell(item), sentinel);
-  }
-
-  const nextCount = rendered + batch.length;
-  container.dataset.renderedCount = String(nextCount);
-
-  if (nextCount >= gridAllItems.length) {
-    sentinel.textContent = "";
-    sentinel.classList.add("grid-scroll-done");
-  } else {
-    sentinel.textContent = `Scroll for more… (${nextCount} of ${gridAllItems.length} shown)`;
-    sentinel.classList.remove("grid-scroll-done");
-  }
-}
-
-function bindGridInfiniteScroll(container) {
-  disconnectGridInfiniteScroll();
-  const sentinel = container.querySelector(".grid-scroll-sentinel");
-  if (!sentinel || gridAllItems.length <= GRID_BATCH_SIZE) {
-    if (sentinel) sentinel.classList.add("grid-scroll-done");
-    return;
-  }
-
-  gridLoadObserver = new IntersectionObserver(
-    (entries) => {
-      if (!entries[0]?.isIntersecting) return;
-      appendGridBatch(container);
-    },
-    { root: container, rootMargin: "240px", threshold: 0 }
-  );
-  gridLoadObserver.observe(sentinel);
 }
 
 function bindGridInteractions() {
@@ -620,21 +807,7 @@ function bindGridInteractions() {
 }
 
 function renderBrandGrid(container, items) {
-  disconnectGridInfiniteScroll();
-  gridAllItems = items || [];
-  container.innerHTML = "";
-  container.dataset.renderedCount = "0";
-  container.scrollTop = 0;
-
-  if (!gridAllItems.length) return;
-
-  const sentinel = document.createElement("div");
-  sentinel.className = "grid-scroll-sentinel";
-  sentinel.setAttribute("aria-hidden", "true");
-  container.appendChild(sentinel);
-
-  appendGridBatch(container);
-  bindGridInfiniteScroll(container);
+  createVirtualGrid(container, items);
 }
 
 function updateGroupCountText() {
@@ -645,7 +818,7 @@ function updateGroupCountText() {
   const active = g.items.length - faultCount;
   const label = mode === "uncertain" ? "Uncertain brand" : "Brand";
   cardCount.textContent =
-    `${label} ${cursor + 1} of ${queue.length} · ${active} active · ${faultCount} marked fault · tap image to toggle`;
+    `${label} ${cursor + 1} of ${queue.length} · ${g.items.length} creatives · ${active} active · ${faultCount} marked fault`;
 }
 
 function applyFaultUi(item, cell, isFault) {
@@ -682,13 +855,10 @@ function markAllGridFaults() {
     setRowReviewState(item.rowIndex, { isFault: true, faultManual: true });
     item.isFault = true;
   }
-
-  for (const cell of cardGrid.querySelectorAll(".thumb-cell")) {
-    if (cell._item) applyFaultUi(cell._item, cell, true);
-  }
   for (const item of gridAllItems) {
     item.isFault = true;
   }
+  gridVirtual?.updateFaultStates();
   updateGroupCountText();
   setReviewStatus("");
 }
@@ -717,10 +887,10 @@ function setUiForMode() {
       "Uncertain ads · grouped by brand (grid: tap ✕ fault, right-click inspect)";
   } else {
     hintLeft.textContent = "";
-    hintRight.textContent = "OK group →";
-    btnFault.textContent = "✕ Mark all on this page";
-    btnOk.textContent = "✓ OK group";
-    modeLabel.textContent = "Review brand groups";
+    hintRight.textContent = "Next →";
+    btnFault.textContent = "✕ Mark all Fault on this page";
+    btnOk.textContent = "✓ Next";
+    modeLabel.textContent = "Reviewing brand groups";
   }
 }
 
@@ -801,8 +971,8 @@ function showCard() {
     }
 
     const gridHint =
-      items.length > GRID_BATCH_SIZE
-        ? "Scroll grid · Tap ✕ fault · Mark all on page · Right-click inspect · Swipe OK"
+      items.length > GRID_LARGE_GROUP
+        ? `${items.length} creatives · scroll to browse · Tap ✕ fault · Mark all on page · Swipe OK`
         : "Tap image to toggle ✕ · Mark all on page · Right-click inspect · Swipe OK group";
     if (mode === "uncertain") {
       const reasonHint =
@@ -1319,6 +1489,7 @@ async function uploadWithPolling(fd) {
 }
 
 function resetForNewUpload() {
+  destroyVirtualGrid();
   sessionId = null;
   brandGroups = [];
   uncertainItems = [];

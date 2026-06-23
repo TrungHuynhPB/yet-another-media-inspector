@@ -316,9 +316,6 @@ header h1 {
 }
 
 .thumb-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-  gap: 12px;
   padding: 0 clamp(0.5rem, 1.5vw, 1rem) 1rem;
   width: 100%;
   max-height: min(72vh, 680px);
@@ -329,6 +326,16 @@ header h1 {
   position: relative;
   z-index: 2;
   pointer-events: auto;
+}
+
+.grid-virtual-spacer {
+  width: 100%;
+  pointer-events: none;
+}
+
+.grid-virtual-cells {
+  display: grid;
+  width: 100%;
 }
 
 .grid-scroll-sentinel {
@@ -353,12 +360,34 @@ header h1 {
   border: 2px solid transparent;
   border-radius: 8px;
   cursor: pointer;
-  background: #000;
+  background: #141820;
   overflow: hidden;
   aspect-ratio: 1;
   transition: border-color 0.15s ease, transform 0.15s ease;
   touch-action: manipulation;
   pointer-events: auto;
+}
+
+.thumb-cell::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    110deg,
+    #141820 0%,
+    #1c2230 45%,
+    #141820 90%
+  );
+  background-size: 200% 100%;
+  animation: thumb-shimmer 1.4s ease-in-out infinite;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.thumb-cell:has(img.loaded)::before,
+.thumb-cell.thumb-load-failed::before {
+  animation: none;
+  opacity: 0;
 }
 
 .thumb-cell:hover {
@@ -371,16 +400,47 @@ header h1 {
 }
 
 .thumb-cell img {
+  position: relative;
+  z-index: 1;
   width: 100%;
   height: 100%;
   object-fit: cover;
   display: block;
   pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.thumb-cell img.loaded {
+  opacity: 1;
+}
+
+.thumb-cell.thumb-load-failed::after {
+  content: "?";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 2rem;
+  color: var(--muted);
+  pointer-events: none;
+}
+
+@keyframes thumb-shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
 }
 
 .thumb-cell .fault-overlay {
   position: absolute;
   inset: 0;
+  z-index: 2;
   display: flex;
   align-items: center;
   justify-content: center;
