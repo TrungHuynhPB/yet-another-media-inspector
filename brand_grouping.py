@@ -80,6 +80,7 @@ def _uncertain_reason_hint(reasons: set[str]) -> str:
         "visual_outlier": "Creatives look different from others in this brand.",
         "missing_brand": "No brand label on these rows.",
         "visual_singleton": "Creatives did not match a visual subgroup.",
+        "no_similar_group": "No similar-image group assigned (empty Group ID).",
     }
     if len(reasons) == 1:
         return labels.get(next(iter(reasons)), "Verify brand labels for this group.")
@@ -136,6 +137,100 @@ def _build_uncertain_groups(
     return groups
 
 
+def _group_id_sort_key(group_id: str) -> tuple[int, str | float, str]:
+    try:
+        return (0, int(group_id), group_id)
+    except ValueError:
+        try:
+            return (0, float(group_id), group_id)
+        except ValueError:
+            return (1, 0, group_id)
+
+
+def _has_source_group_ids(rows: list[dict]) -> bool:
+    return any("sourceGroupId" in row for row in rows)
+
+
+def _build_pre_grouped_brand_groups(
+    rows: list[dict],
+    to_items,
+) -> tuple[list[dict], list[dict]]:
+    """Group by spreadsheet (brand, Group ID); skip visual clustering."""
+    uncertain_rows: list[dict] = []
+    by_brand_group: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    brand_group_counts: Counter[str] = Counter()
+
+    for row in rows:
+        if not row.get("url"):
+            continue
+        brand_key = normalize_brand_key(row.get("brandName") or "")
+        if not brand_key:
+            row["uncertainReason"] = "missing_brand"
+            uncertain_rows.append(row)
+            continue
+
+        thumb = row.get("thumb")
+        if thumb and not Path(thumb).is_file():
+            row["thumb"] = None
+        if not row.get("thumb") and not row.get("thumbRemote"):
+            row["uncertainReason"] = "missing_thumb"
+            row["groupId"] = None
+            uncertain_rows.append(row)
+            continue
+
+        source_group_id = row.get("sourceGroupId")
+        if not source_group_id:
+            row["uncertainReason"] = "no_similar_group"
+            row["groupId"] = None
+            uncertain_rows.append(row)
+            continue
+
+        bucket_key = (brand_key, source_group_id)
+        by_brand_group[bucket_key].append(row)
+        brand_group_counts[brand_key] += 1
+
+    brand_groups: list[dict] = []
+    gid = 0
+    sorted_buckets = sorted(
+        by_brand_group.items(),
+        key=lambda kv: (
+            display_name([m["brandName"] for m in kv[1]], "Unknown brand"),
+            _group_id_sort_key(kv[0][1]),
+        ),
+    )
+
+    for (_brand_key, source_group_id), members in sorted_buckets:
+        brand_title = display_name([m["brandName"] for m in members], "Unknown brand")
+        brand_subtitle = display_name([m.get("advertiserName") or "" for m in members], "")
+        title = (
+            f"{brand_title} ({source_group_id})"
+            if brand_group_counts[_brand_key] > 1
+            else brand_title
+        )
+
+        for m in members:
+            m["groupId"] = gid
+
+        items = to_items(members)
+        brand_groups.append(
+            {
+                "groupId": gid,
+                "type": "brand",
+                "title": title,
+                "subtitle": brand_subtitle,
+                "memberIndices": [int(m["index"]) for m in members],
+                "items": items,
+                "thumbs": [i["thumbUrl"] for i in items if i.get("thumbUrl")],
+                "count": len(members),
+                "urls": [m["url"] for m in members],
+            }
+        )
+        gid += 1
+
+    uncertain_items = _build_uncertain_groups(uncertain_rows, to_items)
+    return brand_groups, uncertain_items
+
+
 def build_unavailable_media(rows: list[dict]) -> dict | None:
     entries = []
     for row in rows:
@@ -170,6 +265,11 @@ def build_brand_groups(
     rows: list[dict],
     to_items,
 ) -> tuple[list[dict], list[dict], dict | None]:
+    if _has_source_group_ids(rows):
+        brand_groups, uncertain_items = _build_pre_grouped_brand_groups(rows, to_items)
+        unavailable_media = build_unavailable_media(rows)
+        return brand_groups, uncertain_items, unavailable_media
+
     by_brand: dict[str, list[dict]] = defaultdict(list)
     uncertain_rows: list[dict] = []
 

@@ -31,8 +31,10 @@ from metadata import (
     classified_export_filename,
     detect_advertiser_name_column,
     detect_brand_column,
+    detect_group_id_column,
     detect_is_faulty_column,
     is_faulty_export_column,
+    parse_group_id_value,
     parse_is_faulty_value,
     prepare_upload_dataframe,
 )
@@ -817,6 +819,7 @@ def _make_row(
     thumb_fetch_detail: str | None = None,
     faulty_col: str | None = None,
     thumb_remote: str | None = None,
+    group_id_col: str | None = None,
 ) -> dict:
     pre_fault = (
         parse_is_faulty_value(df.iloc[idx][faulty_col])
@@ -837,6 +840,8 @@ def _make_row(
         "needsIndividualReview": False,
         "faultManual": pre_fault,
     }
+    if group_id_col:
+        row["sourceGroupId"] = parse_group_id_value(df.iloc[idx][group_id_col])
     if thumb_fetch_detail:
         row["thumbFetchDetail"] = thumb_fetch_detail
     return row
@@ -874,6 +879,7 @@ async def _download_rows(
     cache_dir: Path,
     meta_lookup: dict,
     on_progress=None,
+    group_id_col: str | None = None,
 ) -> list[dict]:
     urls = _urls_from_column(df, col)
     total = len(urls)
@@ -918,6 +924,7 @@ async def _download_rows(
                 detail,
                 faulty_col,
                 remote,
+                group_id_col,
             )
         )
         if on_progress:
@@ -935,6 +942,7 @@ def _finalize_session(
     adv_col: str | None,
     rows: list[dict],
     source_filename: str = "",
+    group_id_col: str | None = None,
 ) -> dict:
     with_url = [r for r in rows if r.get("url")]
     if not with_url:
@@ -958,6 +966,7 @@ def _finalize_session(
             "url_column": col,
             "brand_column": brand_col,
             "adv_column": adv_col,
+            "group_id_column": group_id_col,
             "sourceFilename": source_filename or _load_source_filename(session_id),
             "rows": rows,
             "groups": group_list,
@@ -969,6 +978,8 @@ def _finalize_session(
         },
     )
 
+    grouping_method = "brand+groupId" if group_id_col else "brand"
+
     return {
         "sessionId": session_id,
         "totalRows": len(rows),
@@ -979,7 +990,7 @@ def _finalize_session(
         "groups": group_list,
         "uncertain": uncertain_list,
         "unavailable": unavailable_media,
-        "groupingMethod": "brand",
+        "groupingMethod": grouping_method,
         "warnings": _opencv_warnings(),
     }
 
@@ -1027,6 +1038,7 @@ async def _process_job(
     adv_col: str | None,
     meta_lookup: dict,
     cache_dir: Path,
+    group_id_col: str | None = None,
 ) -> None:
     job = _job_get(job_id)
     if not job:
@@ -1109,6 +1121,7 @@ async def _process_job(
                     detail,
                     faulty_col,
                     remote,
+                    group_id_col,
                 )
             )
             if idx % 5 == 0 or idx + 1 == total:
@@ -1138,6 +1151,7 @@ async def _process_job(
             adv_col,
             rows,
             _load_source_filename(job_id),
+            group_id_col,
         )
         _job_update(
             job_id,
@@ -1187,6 +1201,7 @@ async def create_job(
         df = await asyncio.to_thread(_load_dataframe, raw, file.filename or "")
         col, brand_col, adv_col = _resolve_columns(df, url_column, brand_column)
         meta_lookup = column_lookup(df)
+        group_id_col = detect_group_id_column(list(df.columns))
 
         job_id = str(uuid.uuid4())
         _persist_upload_source(job_id, raw, file.filename or "")
@@ -1218,7 +1233,7 @@ async def create_job(
 
         if _is_serverless():
             await _process_job(
-                job_id, df, col, brand_col, adv_col, meta_lookup, cache_dir
+                job_id, df, col, brand_col, adv_col, meta_lookup, cache_dir, group_id_col
             )
             job = _job_get(job_id) or {}
             return {
@@ -1230,7 +1245,7 @@ async def create_job(
 
         asyncio.create_task(
             _process_job(
-                job_id, df, col, brand_col, adv_col, meta_lookup, cache_dir
+                job_id, df, col, brand_col, adv_col, meta_lookup, cache_dir, group_id_col
             )
         )
         return base_payload
@@ -1313,6 +1328,7 @@ async def upload_stream(
             col, brand_col, adv_col = _resolve_columns(df, url_column, brand_column)
             meta_lookup = column_lookup(df)
             faulty_col = detect_is_faulty_column(list(df.columns))
+            group_id_col = detect_group_id_column(list(df.columns))
             total = len(df)
 
             session_id = str(uuid.uuid4())
@@ -1400,6 +1416,7 @@ async def upload_stream(
                         detail,
                         faulty_col,
                         remote,
+                        group_id_col,
                     )
                 )
                 if idx % 5 == 0 or idx + 1 == total:
@@ -1445,7 +1462,7 @@ async def upload_stream(
             await asyncio.sleep(0)
 
             payload = _finalize_session(
-                session_id, df, col, brand_col, adv_col, rows, filename
+                session_id, df, col, brand_col, adv_col, rows, filename, group_id_col
             )
             payload["type"] = "complete"
             payload["percent"] = 100
@@ -1493,11 +1510,14 @@ async def _process_upload(file: UploadFile, url_column: str, brand_column: str =
     df = await asyncio.to_thread(_load_dataframe, raw, file.filename or "")
     col, brand_col, adv_col = _resolve_columns(df, url_column, brand_column)
     meta_lookup = column_lookup(df)
+    group_id_col = detect_group_id_column(list(df.columns))
     session_id = str(uuid.uuid4())
     _persist_upload_source(session_id, raw, file.filename or "")
     cache_dir = _session_dir(session_id) / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    rows = await _download_rows(df, col, brand_col, adv_col, cache_dir, meta_lookup)
+    rows = await _download_rows(
+        df, col, brand_col, adv_col, cache_dir, meta_lookup, group_id_col=group_id_col
+    )
     return _finalize_session(
         session_id,
         df,
@@ -1506,6 +1526,7 @@ async def _process_upload(file: UploadFile, url_column: str, brand_column: str =
         adv_col,
         rows,
         file.filename or "",
+        group_id_col,
     )
 
 

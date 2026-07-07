@@ -40,6 +40,15 @@ IS_FAULTY_COLUMN_CANDIDATES = (
     "isfaulty",
 )
 
+GROUP_ID_COLUMN_CANDIDATES = (
+    "Group ID",
+    "GROUP_ID",
+    "group_id",
+    "GroupId",
+    "groupId",
+    "GROUP ID",
+)
+
 ADVERTISER_NAME_COLUMN_CANDIDATES = (
     "ADVERTISER_NAME",
     "advertiser_name",
@@ -117,6 +126,29 @@ def _column_from_candidates(
         if cand.lower() in lower:
             return lower[cand.lower()]
     return None
+
+
+def detect_group_id_column(columns: list[str]) -> str | None:
+    return _column_from_candidates(columns, GROUP_ID_COLUMN_CANDIDATES)
+
+
+def parse_group_id_value(value) -> str | None:
+    """Return normalized Group ID string, or None when empty / unset."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, (int, float)) and not pd.isna(value):
+        if isinstance(value, float) and value == int(value):
+            return str(int(value))
+        return str(value)
+    s = _cell_str(value)
+    if not s:
+        return None
+    if s.endswith(".0"):
+        try:
+            return str(int(float(s)))
+        except ValueError:
+            pass
+    return s
 
 
 def detect_brand_column(columns: list[str]) -> str | None:
