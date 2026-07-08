@@ -4,6 +4,7 @@ let uncertainItems = [];
 let unavailableMedia = null;
 let mode = "unavailable"; // unavailable | uncertain | brand
 let cursor = 0;
+let navHistory = [];
 let reviewing = false;
 let contextItem = null;
 let uploadedFilename = "";
@@ -79,6 +80,7 @@ const hintRight = $("hint-right");
 const btnFault = $("btn-fault");
 const btnMarkCorrect = $("btn-mark-correct");
 const btnOk = $("btn-ok");
+const btnBack = $("btn-back");
 
 const REVIEW_STORE_PREFIX = "yami-review:";
 const SOURCE_DB_NAME = "yami-source";
@@ -220,6 +222,24 @@ function setReviewWait(show) {
   btnFault.disabled = Boolean(show);
   if (btnMarkCorrect) btnMarkCorrect.disabled = Boolean(show);
   btnOk.disabled = Boolean(show);
+  updateBackButton();
+}
+
+function updateBackButton() {
+  if (!btnBack) return;
+  const canBack = navHistory.length > 0 && !reviewing;
+  btnBack.disabled = !canBack;
+}
+
+function navigateBack() {
+  if (reviewing || !navHistory.length) return;
+  const prev = navHistory.pop();
+  mode = prev.mode;
+  cursor = prev.cursor;
+  doneSection.classList.add("hidden");
+  reviewSection.classList.remove("hidden");
+  $("export-btn")?.classList.add("hidden");
+  showCard();
 }
 
 function currentQueue() {
@@ -1307,6 +1327,7 @@ function showCard() {
   card.style.transform = "";
   card.style.opacity = "1";
   card.classList.remove("swipe-left", "swipe-right");
+  updateBackButton();
 }
 
 function finishReview() {
@@ -1792,6 +1813,7 @@ function resetForNewUpload() {
   uncertainItems = [];
   unavailableMedia = null;
   cursor = 0;
+  navHistory = [];
   mode = "unavailable";
   reviewing = false;
   $("file-input").value = "";
@@ -1863,6 +1885,7 @@ async function submitReview(leftAction) {
       applyBrandGroupReview(item);
     }
     setReviewStatus("");
+    navHistory.push({ mode, cursor });
     cursor += 1;
     setTimeout(showCard, 220);
   } catch (err) {
@@ -1903,6 +1926,12 @@ function exportResults() {
 
 document.addEventListener("keydown", (e) => {
   if (reviewSection.classList.contains("hidden") || reviewing) return;
+  if (!$("inspect-modal")?.classList.contains("hidden")) return;
+  if (e.key === "Backspace" || e.key === "ArrowUp") {
+    e.preventDefault();
+    navigateBack();
+    return;
+  }
   if (e.key === "ArrowLeft") {
     e.preventDefault();
     if (isGridReviewMode()) {
@@ -1976,6 +2005,7 @@ btnMarkCorrect?.addEventListener("click", () => {
   if (isGridReviewMode()) markAllGridCorrect();
 });
 btnOk.addEventListener("click", () => submitReview(false));
+btnBack?.addEventListener("click", navigateBack);
 $("export-btn").addEventListener("click", exportResults);
 $("export-btn-done").addEventListener("click", exportResults);
 $("upload-another-btn").addEventListener("click", resetForNewUpload);
@@ -2093,6 +2123,7 @@ $("upload-form").addEventListener("submit", async (e) => {
     const data = await uploadFile(fd);
 
     sessionId = data.sessionId;
+    navHistory = [];
     let exportCacheWarn = "";
     try {
       await saveSourceSnapshot(sessionId, sourceSnapshot);

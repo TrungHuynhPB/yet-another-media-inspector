@@ -634,6 +634,30 @@ header h1 {
   border: 3px solid var(--ok);
 }
 
+.btn-back {
+  display: block;
+  width: 100%;
+  margin-bottom: 0.75rem;
+  padding: 0.65rem 1rem;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--muted, #9aa3b2);
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.btn-back:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.btn-back:not(:disabled):hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text, #e8ecf1);
+}
+
 .actions {
   display: flex;
   gap: 1rem;
@@ -668,7 +692,8 @@ header h1 {
 
 .btn-mark-correct:disabled,
 .btn-fault:disabled,
-.btn-ok:disabled {
+.btn-ok:disabled,
+.btn-back:disabled {
   opacity: 0.55;
   cursor: wait;
 }
