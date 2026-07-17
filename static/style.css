@@ -321,6 +321,7 @@ header h1 {
   max-height: min(72vh, 680px);
   overflow-y: auto;
   overflow-x: hidden;
+  scrollbar-gutter: stable;
   background: #0a0c10;
   touch-action: pan-y;
   position: relative;

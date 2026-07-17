@@ -724,9 +724,9 @@ function getGridMetrics(container) {
     1,
     Math.floor((innerW + GRID_GAP_PX) / (GRID_MIN_CELL_PX + GRID_GAP_PX))
   );
-  const cellWidth = (innerW - (columns - 1) * GRID_GAP_PX) / columns;
-  const rowHeight = cellWidth + GRID_GAP_PX;
-  return { columns, cellWidth, rowHeight };
+  const cellWidth = columns > 0 ? (innerW - (columns - 1) * GRID_GAP_PX) / columns : GRID_MIN_CELL_PX;
+  const rowHeight = Math.max(1, cellWidth) + GRID_GAP_PX;
+  return { columns, cellWidth, rowHeight, innerW };
 }
 
 function isTikTokPageUrl(url) {
@@ -929,14 +929,48 @@ function createVirtualGrid(container, items) {
   const mounted = new Map();
   let raf = null;
   let scrollDebounceTimer = null;
+  /** Ignore tiny width jitter (scrollbar) so column count stays stable while scrolling. */
+  const WIDTH_LOCK_PX = 24;
+  let lockedColumns = 0;
+  let lockedInnerW = 0;
+  let lockedRowHeight = GRID_MIN_CELL_PX + GRID_GAP_PX;
+
+  function placeCell(cell, index, columns, startRow) {
+    cell.style.gridColumn = String((index % columns) + 1);
+    cell.style.gridRow = String(Math.floor(index / columns) - startRow + 1);
+  }
+
+  function clearMounted() {
+    for (const cell of mounted.values()) {
+      thumbImageQueue.detach(cell);
+      cell.remove();
+    }
+    mounted.clear();
+  }
 
   function layout() {
     const metrics = getGridMetrics(container);
-    const columns = metrics.columns;
-    let { rowHeight } = metrics;
-    if (!rowHeight || rowHeight <= 0) {
-      rowHeight = GRID_MIN_CELL_PX + GRID_GAP_PX;
+    let columns = metrics.columns;
+    let { rowHeight, innerW } = metrics;
+
+    if (innerW <= 0) {
+      columns = lockedColumns || 1;
+      rowHeight = lockedRowHeight || GRID_MIN_CELL_PX + GRID_GAP_PX;
+    } else if (lockedColumns && Math.abs(innerW - lockedInnerW) < WIDTH_LOCK_PX) {
+      columns = lockedColumns;
+      rowHeight = lockedRowHeight;
+    } else {
+      if (lockedColumns && columns !== lockedColumns) {
+        clearMounted();
+      }
+      lockedColumns = columns;
+      lockedInnerW = innerW;
+      if (!rowHeight || rowHeight <= 0) {
+        rowHeight = GRID_MIN_CELL_PX + GRID_GAP_PX;
+      }
+      lockedRowHeight = rowHeight;
     }
+
     const totalRows = Math.ceil(gridAllItems.length / columns);
     const scrollTop = container.scrollTop;
     const viewH = container.clientHeight || rowHeight * 3;
@@ -969,16 +1003,22 @@ function createVirtualGrid(container, items) {
     }
 
     for (let i = startIndex; i < endIndex; i += 1) {
-      if (mounted.has(i)) continue;
-      const cell = createThumbCell(gridAllItems[i], { deferLoad: true });
-      cell.dataset.virtualIndex = String(i);
-      cell.style.order = String(i);
-      cellsEl.appendChild(cell);
-      mounted.set(i, cell);
-      const cellRow = Math.floor(i / columns);
-      const cellCenterY = cellRow * rowHeight + rowHeight / 2;
-      const priority = Math.abs(cellCenterY - viewCenterY);
-      thumbImageQueue.enqueue(cell, priority);
+      let cell = mounted.get(i);
+      const isNew = !cell;
+      if (isNew) {
+        cell = createThumbCell(gridAllItems[i], { deferLoad: true });
+        cell.dataset.virtualIndex = String(i);
+        cellsEl.appendChild(cell);
+        mounted.set(i, cell);
+      }
+      // Always re-place: startRow shifts on scroll; DOM order must not matter.
+      placeCell(cell, i, columns, startRow);
+      if (isNew) {
+        const cellRow = Math.floor(i / columns);
+        const cellCenterY = cellRow * rowHeight + rowHeight / 2;
+        const priority = Math.abs(cellCenterY - viewCenterY);
+        thumbImageQueue.enqueue(cell, priority);
+      }
     }
   }
 
