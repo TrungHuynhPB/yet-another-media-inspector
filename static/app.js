@@ -455,12 +455,15 @@ function buildClientExportWorkbook(sourceSnap, reviewRows) {
   const headers = [...sourceSnap.headers];
   const rows = sourceSnap.rows.map((r) => [...r]);
 
-  let faultyIdx = sourceSnap.faultyColumn
-    ? headers.indexOf(sourceSnap.faultyColumn)
-    : -1;
-  if (faultyIdx < 0) {
+  const faultColumnNames = new Set(["isfaulty", "is_faulty", "isfault", "is_fault"]);
+  const faultyIndices = headers
+    .map((header, index) =>
+      faultColumnNames.has(String(header || "").trim().toLowerCase()) ? index : -1
+    )
+    .filter((index) => index >= 0);
+  if (!faultyIndices.length) {
     headers.push("isFaulty");
-    faultyIdx = headers.length - 1;
+    faultyIndices.push(headers.length - 1);
     for (const row of rows) row.push("");
   }
 
@@ -478,7 +481,9 @@ function buildClientExportWorkbook(sourceSnap, reviewRows) {
 
   for (let i = 0; i < rows.length; i += 1) {
     const state = reviewRows[String(i)] || {};
-    rows[i][faultyIdx] = Boolean(state.isFault);
+    for (const faultyIdx of faultyIndices) {
+      rows[i][faultyIdx] = Boolean(state.isFault);
+    }
     rows[i][extraIdx.advertiserMatch] =
       state.advertiserMatch == null ? "" : state.advertiserMatch;
     rows[i][extraIdx.reviewed] = Boolean(state.reviewed);
@@ -490,6 +495,26 @@ function buildClientExportWorkbook(sourceSnap, reviewRows) {
   return wb;
 }
 
+function effectiveReviewRowsForExport() {
+  const stored = loadReviewStore();
+  const rows = { ...(stored.rows || {}) };
+
+  // The queue objects are the state shown to the reviewer. Overlay them so
+  // export remains correct even if browser storage was stale or a write failed.
+  for (const group of [...uncertainItems, ...brandGroups]) {
+    for (const item of group?.items || []) {
+      if (item?.rowIndex == null) continue;
+      const key = String(item.rowIndex);
+      rows[key] = {
+        ...(rows[key] || {}),
+        isFault: Boolean(item.isFault),
+        faultManual: Boolean(item.isFault),
+      };
+    }
+  }
+  return rows;
+}
+
 async function exportResultsClient() {
   if (!sessionId) throw new Error("No active session.");
   const sourceSnap = await loadSourceSnapshot(sessionId);
@@ -498,8 +523,8 @@ async function exportResultsClient() {
       "Source file not found in this browser. Re-upload the same file, then export again."
     );
   }
-  const review = loadReviewStore();
-  const wb = buildClientExportWorkbook(sourceSnap, review.rows || {});
+  const reviewRows = effectiveReviewRowsForExport();
+  const wb = buildClientExportWorkbook(sourceSnap, reviewRows);
   const filename = classifiedExportFilename(sourceSnap.filename || uploadedFilename);
   XLSX.writeFile(wb, filename);
 }
@@ -543,6 +568,16 @@ function groupReviewIndices(item) {
     .filter((i) => Number.isFinite(i));
 }
 
+function setGroupItemFault(item, rowIndex, isFault) {
+  const key = Number(rowIndex);
+  for (const candidate of item?.items || []) {
+    if (Number(candidate?.rowIndex) === key) candidate.isFault = Boolean(isFault);
+  }
+  for (const candidate of gridAllItems || []) {
+    if (Number(candidate?.rowIndex) === key) candidate.isFault = Boolean(isFault);
+  }
+}
+
 function applyUnavailableReview(isFault) {
   for (const entry of unavailableMedia?.entries || []) {
     setRowReviewState(entry.rowIndex, {
@@ -572,6 +607,7 @@ function applyUncertainGroupReview(item, advertiserMatch) {
       isFault,
       faultManual: isFault,
     });
+    setGroupItemFault(item, idx, isFault);
   }
 }
 
@@ -588,6 +624,7 @@ function applyBrandGroupReview(item) {
       isFault,
       faultManual: isFault,
     });
+    setGroupItemFault(item, idx, isFault);
   }
 }
 
