@@ -348,7 +348,7 @@ function openSourceDb() {
 
 function detectFaultyExportColumn(headers) {
   const lower = headers.map((h) => String(h || "").trim().toLowerCase());
-  for (const key of ["isfaulty", "is_faulty"]) {
+  for (const key of ["isfaulty", "is_faulty", "isfault", "is_fault"]) {
     const i = lower.indexOf(key);
     if (i >= 0) return headers[i];
   }
@@ -521,6 +521,28 @@ function applyReviewStoreToQueues() {
   for (const g of uncertainItems) hydrateGroup(g);
 }
 
+function faultStateFromGroupItems(item) {
+  const byIdx = new Map();
+  for (const it of item?.items || []) {
+    if (it?.rowIndex == null) continue;
+    byIdx.set(Number(it.rowIndex), Boolean(it.isFault));
+  }
+  // Prefer live grid marks when they share the same item objects.
+  for (const it of gridAllItems || []) {
+    if (it?.rowIndex == null) continue;
+    const idx = Number(it.rowIndex);
+    if (byIdx.has(idx)) byIdx.set(idx, Boolean(it.isFault));
+  }
+  return byIdx;
+}
+
+function groupReviewIndices(item) {
+  if (item?.memberIndices?.length) return item.memberIndices.map((i) => Number(i));
+  return (item?.items || [])
+    .map((i) => Number(i.rowIndex))
+    .filter((i) => Number.isFinite(i));
+}
+
 function applyUnavailableReview(isFault) {
   for (const entry of unavailableMedia?.entries || []) {
     setRowReviewState(entry.rowIndex, {
@@ -533,33 +555,38 @@ function applyUnavailableReview(isFault) {
 }
 
 function applyUncertainGroupReview(item, advertiserMatch) {
-  const indices = item.memberIndices?.length
-    ? item.memberIndices
-    : (item.items || []).map((i) => i.rowIndex);
-  for (const idx of indices) {
+  const marks = faultStateFromGroupItems(item);
+  for (const idx of groupReviewIndices(item)) {
     const existing = getRowState(idx) || {};
-    const manual = Boolean(existing.faultManual);
+    let isFault;
+    if (!advertiserMatch) {
+      isFault = true;
+    } else if (marks.has(idx)) {
+      isFault = marks.get(idx);
+    } else {
+      isFault = Boolean(existing.faultManual && existing.isFault);
+    }
     setRowReviewState(idx, {
       reviewed: true,
       advertiserMatch,
-      isFault: !advertiserMatch ? true : manual ? Boolean(existing.isFault) : false,
-      faultManual: manual,
+      isFault,
+      faultManual: isFault,
     });
   }
 }
 
 function applyBrandGroupReview(item) {
-  const indices = item.memberIndices?.length
-    ? item.memberIndices
-    : (item.items || []).map((i) => i.rowIndex);
-  for (const idx of indices) {
+  const marks = faultStateFromGroupItems(item);
+  for (const idx of groupReviewIndices(item)) {
     const existing = getRowState(idx) || {};
-    const manual = Boolean(existing.faultManual);
+    const isFault = marks.has(idx)
+      ? marks.get(idx)
+      : Boolean(existing.faultManual && existing.isFault);
     setRowReviewState(idx, {
       reviewed: true,
       advertiserMatch: true,
-      isFault: manual ? Boolean(existing.isFault) : false,
-      faultManual: manual,
+      isFault,
+      faultManual: isFault,
     });
   }
 }
