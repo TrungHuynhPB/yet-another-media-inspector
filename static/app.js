@@ -972,6 +972,7 @@ function createVirtualGrid(container, items) {
       if (mounted.has(i)) continue;
       const cell = createThumbCell(gridAllItems[i], { deferLoad: true });
       cell.dataset.virtualIndex = String(i);
+      cell.style.order = String(i);
       cellsEl.appendChild(cell);
       mounted.set(i, cell);
       const cellRow = Math.floor(i / columns);
