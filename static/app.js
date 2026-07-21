@@ -86,7 +86,110 @@ const btnBack = $("btn-back");
 const REVIEW_STORE_PREFIX = "yami-review:";
 const SOURCE_DB_NAME = "yami-source";
 const SOURCE_STORE = "sources";
-const SOURCE_DB_VERSION = 1;
+const REVIEW_STORE = "reviews";
+const SOURCE_DB_VERSION = 2;
+
+let reviewStoreCache = null;
+let reviewPersistTimer = null;
+
+function emptyReviewStore(sid) {
+  return {
+    sessionId: sid || null,
+    filename: "",
+    totalRows: 0,
+    rows: {},
+    groupNotes: {},
+  };
+}
+
+function openAppDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(SOURCE_DB_NAME, SOURCE_DB_VERSION);
+    req.onerror = () => reject(req.error || new Error("IndexedDB unavailable"));
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(SOURCE_STORE)) {
+        db.createObjectStore(SOURCE_STORE, { keyPath: "sessionId" });
+      }
+      if (!db.objectStoreNames.contains(REVIEW_STORE)) {
+        db.createObjectStore(REVIEW_STORE, { keyPath: "sessionId" });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+  });
+}
+
+const openSourceDb = openAppDb;
+
+async function persistReviewStore() {
+  if (!sessionId || !reviewStoreCache) return;
+  try {
+    const db = await openAppDb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(REVIEW_STORE, "readwrite");
+      tx.objectStore(REVIEW_STORE).put({
+        ...reviewStoreCache,
+        sessionId,
+        savedAt: Date.now(),
+      });
+      tx.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      tx.onerror = () => {
+        db.close();
+        reject(tx.error || new Error("Could not save review in browser"));
+      };
+    });
+  } catch (err) {
+    setReviewStatus(`Could not save review in browser: ${err.message || err}`);
+    throw err;
+  }
+}
+
+function scheduleReviewPersist() {
+  if (reviewPersistTimer) clearTimeout(reviewPersistTimer);
+  reviewPersistTimer = setTimeout(() => {
+    reviewPersistTimer = null;
+    persistReviewStore().catch(() => {});
+  }, 400);
+}
+
+async function flushReviewPersist() {
+  if (reviewPersistTimer) {
+    clearTimeout(reviewPersistTimer);
+    reviewPersistTimer = null;
+  }
+  await persistReviewStore();
+}
+
+function migrateReviewFromLocalStorage(sid) {
+  if (!sid || !reviewStoreCache) return;
+  try {
+    const raw = localStorage.getItem(REVIEW_STORE_PREFIX + sid);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    for (const [key, row] of Object.entries(parsed.rows || {})) {
+      const existing = reviewStoreCache.rows[key] || {};
+      reviewStoreCache.rows[key] = {
+        isFault: Boolean(row.isFault ?? existing.isFault),
+        faultManual: Boolean(row.faultManual ?? existing.faultManual),
+        reviewed: Boolean(row.reviewed ?? existing.reviewed),
+        advertiserMatch:
+          row.advertiserMatch !== undefined ? row.advertiserMatch : existing.advertiserMatch ?? null,
+        note: row.note != null ? String(row.note) : existing.note || "",
+        noteManual: Boolean(row.noteManual ?? existing.noteManual),
+      };
+    }
+    reviewStoreCache.groupNotes = {
+      ...(parsed.groupNotes || {}),
+      ...(reviewStoreCache.groupNotes || {}),
+    };
+    localStorage.removeItem(REVIEW_STORE_PREFIX + sid);
+  } catch (err) {
+    console.warn("Review localStorage migration failed:", err);
+  }
+}
 
 function setStatus(msg) {
   $("upload-status").textContent = msg;
@@ -258,25 +361,21 @@ function totalReviewSteps() {
 }
 
 function loadReviewStore() {
-  if (!sessionId) return { sessionId: null, rows: {}, groupNotes: {} };
-  try {
-    const raw = localStorage.getItem(REVIEW_STORE_PREFIX + sessionId);
-    if (!raw) return { sessionId, rows: {}, groupNotes: {} };
-    const parsed = JSON.parse(raw);
-    if (!parsed.groupNotes) parsed.groupNotes = {};
-    return parsed;
-  } catch {
-    return { sessionId, rows: {}, groupNotes: {} };
+  if (!sessionId) return emptyReviewStore(null);
+  if (!reviewStoreCache) {
+    reviewStoreCache = emptyReviewStore(sessionId);
+    reviewStoreCache.filename = uploadedFilename || "";
   }
+  if (!reviewStoreCache.groupNotes) reviewStoreCache.groupNotes = {};
+  if (!reviewStoreCache.rows) reviewStoreCache.rows = {};
+  return reviewStoreCache;
 }
 
 function saveReviewStore(store) {
   if (!sessionId) return;
-  try {
-    localStorage.setItem(REVIEW_STORE_PREFIX + sessionId, JSON.stringify(store));
-  } catch (err) {
-    setReviewStatus(`Could not save review in browser: ${err.message || err}`);
-  }
+  if (store) reviewStoreCache = store;
+  if (!reviewStoreCache) return;
+  scheduleReviewPersist();
 }
 
 function getRowState(rowIndex) {
@@ -291,31 +390,19 @@ function setRowReviewState(rowIndex, patch) {
   saveReviewStore(store);
 }
 
-function initReviewStore(data) {
+async function initReviewStore(data) {
   const rows = {};
-  const total = Number(data.totalRows) || 0;
-  for (let i = 0; i < total; i++) {
-    rows[String(i)] = {
-      isFault: false,
-      faultManual: false,
-      reviewed: false,
-      advertiserMatch: null,
-      brandName: "",
-      advertiserName: "",
-      note: "",
-      noteManual: false,
-    };
-  }
 
   function mergeItem(item) {
     const idx = String(item.rowIndex);
-    const meta = item.metadata || {};
     rows[idx] = {
-      ...rows[idx],
+      ...(rows[idx] || {}),
       isFault: Boolean(item.isFault),
       faultManual: Boolean(item.isFault),
-      brandName: meta.brand || rows[idx].brandName || "",
-      advertiserName: meta.advertiser_name || rows[idx].advertiserName || "",
+      reviewed: false,
+      advertiserMatch: null,
+      note: "",
+      noteManual: false,
     };
   }
 
@@ -325,35 +412,21 @@ function initReviewStore(data) {
   for (const g of data.uncertain || []) {
     for (const item of g.items || []) mergeItem(item);
   }
-  for (const entry of data.unavailable?.entries || []) {
-    const idx = String(entry.rowIndex);
-    rows[idx] = {
-      ...rows[idx],
-      brandName: entry.brand || rows[idx].brandName || "",
-      advertiserName: entry.advertiserName || rows[idx].advertiserName || "",
-    };
-  }
 
-  saveReviewStore({
+  reviewStoreCache = {
     sessionId: data.sessionId,
     filename: uploadedFilename,
+    totalRows: Number(data.totalRows) || 0,
     rows,
     groupNotes: {},
-  });
-}
+  };
 
-function openSourceDb() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(SOURCE_DB_NAME, SOURCE_DB_VERSION);
-    req.onerror = () => reject(req.error || new Error("IndexedDB unavailable"));
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      if (!db.objectStoreNames.contains(SOURCE_STORE)) {
-        db.createObjectStore(SOURCE_STORE, { keyPath: "sessionId" });
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-  });
+  migrateReviewFromLocalStorage(data.sessionId);
+  try {
+    await flushReviewPersist();
+  } catch (err) {
+    console.warn("Initial review persist failed:", err);
+  }
 }
 
 function detectFaultyExportColumn(headers) {
@@ -531,6 +604,7 @@ function effectiveReviewRowsForExport() {
 
 async function exportResultsClient() {
   if (!sessionId) throw new Error("No active session.");
+  await flushReviewPersist();
   const sourceSnap = await loadSourceSnapshot(sessionId);
   if (!sourceSnap?.headers?.length) {
     throw new Error(
@@ -2101,6 +2175,11 @@ async function uploadWithPolling(fd) {
 
 function resetForNewUpload() {
   destroyVirtualGrid();
+  if (reviewPersistTimer) {
+    clearTimeout(reviewPersistTimer);
+    reviewPersistTimer = null;
+  }
+  reviewStoreCache = null;
   sessionId = null;
   brandGroups = [];
   uncertainItems = [];
@@ -2428,7 +2507,7 @@ $("upload-form").addEventListener("submit", async (e) => {
     brandGroups = data.groups || [];
     uncertainItems = normalizeUncertainItems(data.uncertain || []);
     unavailableMedia = data.unavailable || null;
-    initReviewStore(data);
+    await initReviewStore(data);
     applyReviewStoreToQueues();
     cursor = 0;
     mode = unavailableMedia
