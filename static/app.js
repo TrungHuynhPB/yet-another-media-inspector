@@ -7,6 +7,7 @@ let cursor = 0;
 let navHistory = [];
 let reviewing = false;
 let contextItem = null;
+let inspectContextItem = null;
 let uploadedFilename = "";
 
 const RING_CIRCUMFERENCE = 2 * Math.PI * 52;
@@ -257,13 +258,15 @@ function totalReviewSteps() {
 }
 
 function loadReviewStore() {
-  if (!sessionId) return { sessionId: null, rows: {} };
+  if (!sessionId) return { sessionId: null, rows: {}, groupNotes: {} };
   try {
     const raw = localStorage.getItem(REVIEW_STORE_PREFIX + sessionId);
-    if (!raw) return { sessionId, rows: {} };
-    return JSON.parse(raw);
+    if (!raw) return { sessionId, rows: {}, groupNotes: {} };
+    const parsed = JSON.parse(raw);
+    if (!parsed.groupNotes) parsed.groupNotes = {};
+    return parsed;
   } catch {
-    return { sessionId, rows: {} };
+    return { sessionId, rows: {}, groupNotes: {} };
   }
 }
 
@@ -299,6 +302,8 @@ function initReviewStore(data) {
       advertiserMatch: null,
       brandName: "",
       advertiserName: "",
+      note: "",
+      noteManual: false,
     };
   }
 
@@ -329,7 +334,12 @@ function initReviewStore(data) {
     };
   }
 
-  saveReviewStore({ sessionId: data.sessionId, filename: uploadedFilename, rows });
+  saveReviewStore({
+    sessionId: data.sessionId,
+    filename: uploadedFilename,
+    rows,
+    groupNotes: {},
+  });
 }
 
 function openSourceDb() {
@@ -467,10 +477,12 @@ function buildClientExportWorkbook(sourceSnap, reviewRows) {
     for (const row of rows) row.push("");
   }
 
-  const extraCols = ["advertiserMatch", "reviewed"];
+  const extraCols = ["advertiserMatch", "reviewed", "Note"];
   const extraIdx = {};
   for (const col of extraCols) {
-    let idx = headers.indexOf(col);
+    let idx = headers.findIndex(
+      (h) => String(h || "").trim().toLowerCase() === col.toLowerCase()
+    );
     if (idx < 0) {
       headers.push(col);
       idx = headers.length - 1;
@@ -487,6 +499,7 @@ function buildClientExportWorkbook(sourceSnap, reviewRows) {
     rows[i][extraIdx.advertiserMatch] =
       state.advertiserMatch == null ? "" : state.advertiserMatch;
     rows[i][extraIdx.reviewed] = Boolean(state.reviewed);
+    rows[i][extraIdx.Note] = state.note == null ? "" : String(state.note);
   }
 
   const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
@@ -509,6 +522,7 @@ function effectiveReviewRowsForExport() {
         ...(rows[key] || {}),
         isFault: Boolean(item.isFault),
         faultManual: Boolean(item.isFault),
+        note: item.note != null ? String(item.note) : rows[key]?.note || "",
       };
     }
   }
@@ -533,6 +547,7 @@ function hydrateItemFromStore(item) {
   const state = getRowState(item.rowIndex);
   if (state) {
     item.isFault = Boolean(state.isFault);
+    item.note = state.note == null ? "" : String(state.note);
   }
   return item;
 }
@@ -578,6 +593,62 @@ function setGroupItemFault(item, rowIndex, isFault) {
   }
 }
 
+function setGroupItemNote(item, rowIndex, note) {
+  const key = Number(rowIndex);
+  const text = note == null ? "" : String(note);
+  for (const candidate of item?.items || []) {
+    if (Number(candidate?.rowIndex) === key) candidate.note = text;
+  }
+  for (const candidate of gridAllItems || []) {
+    if (Number(candidate?.rowIndex) === key) candidate.note = text;
+  }
+}
+
+function getGroupNote(groupId) {
+  if (groupId == null) return "";
+  const store = loadReviewStore();
+  return store.groupNotes?.[String(groupId)]?.note || "";
+}
+
+function setGroupNote(groupId, note) {
+  if (groupId == null) return;
+  const store = loadReviewStore();
+  if (!store.groupNotes) store.groupNotes = {};
+  store.groupNotes[String(groupId)] = { note: String(note || "") };
+  saveReviewStore(store);
+}
+
+function applyGroupNoteToRows(group, noteText) {
+  if (!group) return;
+  const groupNote = String(noteText ?? "");
+  const store = loadReviewStore();
+  const marks = faultStateFromGroupItems(group);
+
+  for (const idx of groupReviewIndices(group)) {
+    const key = String(idx);
+    const existing = store.rows[key] || {};
+    if (existing.noteManual) continue;
+    const isFault = marks.has(idx) ? marks.get(idx) : Boolean(existing.isFault);
+    const nextNote = isFault ? "" : groupNote;
+    store.rows[key] = { ...existing, note: nextNote };
+    setGroupItemNote(group, idx, nextNote);
+  }
+  saveReviewStore(store);
+}
+
+function applyNoteAfterFaultChange(group, rowIndex, isFault) {
+  if (!group || rowIndex == null) return;
+  const store = loadReviewStore();
+  const key = String(rowIndex);
+  const existing = store.rows[key] || {};
+  if (existing.noteManual) return;
+  const groupNote = getGroupNote(group.groupId);
+  const nextNote = isFault ? "" : groupNote;
+  store.rows[key] = { ...existing, note: nextNote };
+  saveReviewStore(store);
+  setGroupItemNote(group, rowIndex, nextNote);
+}
+
 function applyUnavailableReview(isFault) {
   for (const entry of unavailableMedia?.entries || []) {
     setRowReviewState(entry.rowIndex, {
@@ -591,8 +662,12 @@ function applyUnavailableReview(isFault) {
 
 function applyUncertainGroupReview(item, advertiserMatch) {
   const marks = faultStateFromGroupItems(item);
+  const store = loadReviewStore();
+  const groupNote = getGroupNote(item?.groupId);
+
   for (const idx of groupReviewIndices(item)) {
-    const existing = getRowState(idx) || {};
+    const key = String(idx);
+    const existing = store.rows[key] || {};
     let isFault;
     if (!advertiserMatch) {
       isFault = true;
@@ -601,31 +676,55 @@ function applyUncertainGroupReview(item, advertiserMatch) {
     } else {
       isFault = Boolean(existing.faultManual && existing.isFault);
     }
-    setRowReviewState(idx, {
+
+    let note = existing.note == null ? "" : String(existing.note);
+    if (!existing.noteManual) {
+      note = isFault ? "" : groupNote;
+    }
+
+    store.rows[key] = {
+      ...existing,
       reviewed: true,
       advertiserMatch,
       isFault,
       faultManual: isFault,
-    });
+      note,
+    };
     setGroupItemFault(item, idx, isFault);
+    if (!existing.noteManual) setGroupItemNote(item, idx, note);
   }
+  saveReviewStore(store);
 }
 
 function applyBrandGroupReview(item) {
   const marks = faultStateFromGroupItems(item);
+  const store = loadReviewStore();
+  const groupNote = getGroupNote(item?.groupId);
+
   for (const idx of groupReviewIndices(item)) {
-    const existing = getRowState(idx) || {};
+    const key = String(idx);
+    const existing = store.rows[key] || {};
     const isFault = marks.has(idx)
       ? marks.get(idx)
       : Boolean(existing.faultManual && existing.isFault);
-    setRowReviewState(idx, {
+
+    let note = existing.note == null ? "" : String(existing.note);
+    if (!existing.noteManual) {
+      note = isFault ? "" : groupNote;
+    }
+
+    store.rows[key] = {
+      ...existing,
       reviewed: true,
       advertiserMatch: true,
       isFault,
       faultManual: isFault,
-    });
+      note,
+    };
     setGroupItemFault(item, idx, isFault);
+    if (!existing.noteManual) setGroupItemNote(item, idx, note);
   }
+  saveReviewStore(store);
 }
 
 function renderUnavailableTable(session) {
@@ -1233,11 +1332,13 @@ async function toggleImageFault(item, cell) {
   if (cell.dataset.toggling === "1") return;
   cell.dataset.toggling = "1";
   const nextFault = !Boolean(item.isFault);
+  const group = currentQueue()[cursor];
   applyFaultUi(item, cell, nextFault);
   setRowReviewState(item.rowIndex, {
     isFault: nextFault,
     faultManual: nextFault,
   });
+  applyNoteAfterFaultChange(group, item.rowIndex, nextFault);
   updateGroupCountText();
   setReviewStatus("");
   delete cell.dataset.toggling;
@@ -1249,13 +1350,22 @@ function markAllGridFaults() {
   const items = group?.items || [];
   if (!items.length) return;
 
+  const store = loadReviewStore();
   for (const item of items) {
-    setRowReviewState(item.rowIndex, { isFault: true, faultManual: true });
+    const key = String(item.rowIndex);
+    const existing = store.rows[key] || {};
+    const patch = { isFault: true, faultManual: true };
+    if (!existing.noteManual) patch.note = "";
+    store.rows[key] = { ...existing, ...patch };
     item.isFault = true;
+    if (!existing.noteManual) item.note = "";
   }
   for (const item of gridAllItems) {
     item.isFault = true;
+    const existing = store.rows[String(item.rowIndex)] || {};
+    if (!existing.noteManual) item.note = "";
   }
+  saveReviewStore(store);
   gridVirtual?.updateFaultStates();
   updateGroupCountText();
   setReviewStatus("");
@@ -1267,13 +1377,23 @@ function markAllGridCorrect() {
   const items = group?.items || [];
   if (!items.length) return;
 
+  const store = loadReviewStore();
+  const groupNote = getGroupNote(group?.groupId);
   for (const item of items) {
-    setRowReviewState(item.rowIndex, { isFault: false, faultManual: false });
+    const key = String(item.rowIndex);
+    const existing = store.rows[key] || {};
+    const patch = { isFault: false, faultManual: false };
+    if (!existing.noteManual) patch.note = groupNote;
+    store.rows[key] = { ...existing, ...patch };
     item.isFault = false;
+    if (!existing.noteManual) item.note = groupNote;
   }
   for (const item of gridAllItems) {
     item.isFault = false;
+    const existing = store.rows[String(item.rowIndex)] || {};
+    if (!existing.noteManual) item.note = groupNote;
   }
+  saveReviewStore(store);
   gridVirtual?.updateFaultStates();
   updateGroupCountText();
   setReviewStatus("");
@@ -1320,6 +1440,56 @@ function formatAdvertiserSubtitle(text) {
   return String(text).trim();
 }
 
+function setCardGroupNote(group) {
+  const wrap = $("card-group-note-wrap");
+  const field = $("card-group-note");
+  if (!wrap || !field) return;
+  const show = isGridReviewMode();
+  wrap.classList.toggle("hidden", !show);
+  if (!show) {
+    field.value = "";
+    return;
+  }
+  field.value = group?.groupId != null ? getGroupNote(group.groupId) : "";
+}
+
+function saveInspectNote() {
+  if (!inspectContextItem || inspectContextItem.rowIndex == null) return;
+  const field = $("inspect-note");
+  if (!field) return;
+  const note = String(field.value || "");
+  setRowReviewState(inspectContextItem.rowIndex, { note, noteManual: true });
+  inspectContextItem.note = note;
+  setGroupItemNote({ items: [inspectContextItem] }, inspectContextItem.rowIndex, note);
+}
+
+function saveGroupNoteFromField() {
+  if (!isGridReviewMode() || reviewing) return;
+  const group = currentQueue()[cursor];
+  if (!group || group.groupId == null) return;
+  const field = $("card-group-note");
+  if (!field) return;
+  const note = String(field.value || "");
+  setGroupNote(group.groupId, note);
+  applyGroupNoteToRows(group, note);
+}
+
+function bindNoteFields() {
+  const inspectField = $("inspect-note");
+  if (inspectField && inspectField.dataset.bound !== "1") {
+    inspectField.dataset.bound = "1";
+    inspectField.addEventListener("input", saveInspectNote);
+    inspectField.addEventListener("blur", saveInspectNote);
+  }
+
+  const groupField = $("card-group-note");
+  if (groupField && groupField.dataset.bound !== "1") {
+    groupField.dataset.bound = "1";
+    groupField.addEventListener("input", saveGroupNoteFromField);
+    groupField.addEventListener("blur", saveGroupNoteFromField);
+  }
+}
+
 function setCardHeader({ title, subtitle, hint }) {
   if (cardTitle) cardTitle.textContent = title || "Unknown brand";
   const sub = formatAdvertiserSubtitle(subtitle);
@@ -1364,6 +1534,7 @@ function showCard() {
       hint: "Open creative URLs in the table (new tab). Swipe right when done, or left to mark all as fault.",
     });
     cardCount.textContent = `${session.count} unavailable · 1 review step`;
+    $("card-group-note-wrap")?.classList.add("hidden");
     renderUnavailableTable(session);
   } else {
     if (mode === "uncertain" && cursor >= uncertainItems.length) {
@@ -1413,6 +1584,7 @@ function showCard() {
     }
     if (cardGrid) cardGrid.classList.remove("hidden");
     if (cardSingle) cardSingle.classList.add("hidden");
+    setCardGroupNote(item);
     renderBrandGrid(cardGrid, items);
     updateGroupCountText();
   }
@@ -1593,9 +1765,12 @@ function setImgSrcWithFallback(img, sources) {
 
 function openInspectModal(item) {
   hideContextMenu();
+  inspectContextItem = item;
   const modal = $("inspect-modal");
   const mediaEl = $("inspect-media");
   const metaEl = $("inspect-meta");
+  const noteWrap = $("inspect-note-wrap");
+  const noteField = $("inspect-note");
   const url = item.mediaUrl || "";
   const thumb = item.thumbUrl || url;
 
@@ -1703,10 +1878,23 @@ function openInspectModal(item) {
     metaEl.appendChild(dd);
   }
 
+  if (noteWrap && noteField) {
+    const showNote = mode === "uncertain";
+    noteWrap.classList.toggle("hidden", !showNote);
+    if (showNote && item?.rowIndex != null) {
+      const state = getRowState(item.rowIndex) || {};
+      noteField.value = state.note == null ? "" : String(state.note);
+    } else {
+      noteField.value = "";
+    }
+  }
+
   modal.classList.remove("hidden");
 }
 
 function closeInspectModal() {
+  saveInspectNote();
+  inspectContextItem = null;
   $("inspect-modal").classList.add("hidden");
   const mediaEl = $("inspect-media");
   const video = mediaEl.querySelector("video");
@@ -2087,7 +2275,7 @@ function bindSwipeZones() {
 
   card.addEventListener("pointerdown", (e) => {
     if (reviewing || e.button !== 0) return;
-    if (e.target.closest(".thumb-cell, .thumb-grid")) return;
+    if (e.target.closest(".thumb-cell, .thumb-grid, .card-group-note")) return;
     if (mode === "unavailable" && e.target.closest(".unavailable-table a")) return;
     if (mode !== "unavailable" && !e.target.closest(".card-swipe-zone")) return;
 
@@ -2101,6 +2289,7 @@ function bindSwipeZones() {
 
 bindGridInteractions();
 bindSwipeZones();
+bindNoteFields();
 
 btnFault.addEventListener("click", () => {
   if (isGridReviewMode()) markAllGridFaults();

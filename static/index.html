@@ -87,6 +87,10 @@
             <h2 id="card-title" class="group-title"></h2>
             <p id="card-subtitle" class="card-subtitle hidden"></p>
             <p id="card-hint" class="card-hint hidden"></p>
+            <div id="card-group-note-wrap" class="card-group-note-wrap hidden">
+              <label for="card-group-note" class="card-group-note-label">Note</label>
+              <textarea id="card-group-note" class="card-group-note" rows="2" placeholder="Applies to all non-fault ads in this group"></textarea>
+            </div>
           </div>
           <div id="card-grid" class="thumb-grid" aria-label="Creatives"></div>
           <div id="card-single" class="card-single hidden" aria-label="Creative"></div>
@@ -147,6 +151,10 @@
         <p id="inspect-subtitle" class="inspect-subtitle hidden"></p>
         <div id="inspect-media" class="inspect-media"></div>
         <dl id="inspect-meta" class="inspect-meta"></dl>
+        <div id="inspect-note-wrap" class="inspect-note-wrap hidden">
+          <label for="inspect-note" class="inspect-note-label">Note</label>
+          <textarea id="inspect-note" class="inspect-note" rows="3" placeholder="Add a note for this ad…"></textarea>
+        </div>
       </div>
     </div>
 
@@ -167,6 +175,6 @@
     </div>
   </div>
   <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
-  <script src="/static/app.js?v=30"></script>
+  <script src="/static/app.js?v=31"></script>
 </body>
 </html>
