@@ -57,7 +57,10 @@ const META_LABELS = {
   creative_campaign_name: "Campaign name",
   creative_video_title: "Video title",
   social_page_name: "Page name",
+  channel_name: "Channel",
+  publisher_name: "Publisher",
   creative_url: "Creative URL",
+  creative_landingpage_url: "Landing page URL",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -1922,15 +1925,17 @@ function openInspectModal(item) {
   const order = [
     "brand",
     "advertiser_name",
-    "platform",
-    "social_headline_text",
-    "social_description",
-    "social_campaign_text",
+    "channel_name",
+    "publisher_name",
     "creative_campaign_name",
     "creative_video_title",
-    "social_page_name",
+    "social_campaign_text",
     "creative_url",
+    "creative_landingpage_url",
+    "social_headline_text",
+    "social_description",
   ];
+  const urlKeys = new Set(["creative_url", "creative_landingpage_url"]);
   for (const key of order) {
     if (key === "brand" || key === "advertiser_name") continue;
     const val = meta[key];
@@ -1938,7 +1943,7 @@ function openInspectModal(item) {
     const dt = document.createElement("dt");
     dt.textContent = META_LABELS[key] || key;
     const dd = document.createElement("dd");
-    if (key === "creative_url") {
+    if (urlKeys.has(key)) {
       const a = document.createElement("a");
       a.href = val;
       a.target = "_blank";

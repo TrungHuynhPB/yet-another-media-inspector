@@ -87,7 +87,18 @@ INSPECT_FIELD_MAP: list[tuple[str, list[str]]] = [
     ("creative_campaign_name", ["CREATIVE_CAMPAIGN_NAME", "creative_campaign_name"]),
     ("creative_video_title", ["CREATIVE_VIDEO_TITLE", "creative_video_title"]),
     ("social_page_name", ["SOCIAL_PAGE_NAME", "social_page_name"]),
+    ("channel_name", ["CHANNEL_NAME", "channel_name"]),
+    ("publisher_name", ["PUBLISHER_NAME", "publisher_name"]),
     ("creative_url", ["CREATIVE_URL_SUPPLIER", "creative_url_supplier", "url", "media_url"]),
+    (
+        "creative_landingpage_url",
+        [
+            "CREATIVE_LANDINGPAGE_URL",
+            "creative_landingpage_url",
+            "CREATIVE_LANDING_PAGE_URL",
+            "creative_landing_page_url",
+        ],
+    ),
 ]
 
 
