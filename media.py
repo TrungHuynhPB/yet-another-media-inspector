@@ -17,6 +17,8 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 
+from meta_scrape import first_meta_image_url, is_meta_page_url
+
 DEFAULT_THUMBNAIL_WORKERS = 24
 SERVERLESS_THUMBNAIL_WORKERS = 6
 SERVERLESS_THUMB_MAX_PX = 240
@@ -36,6 +38,7 @@ ADCLARITY_ORIGIN = "https://ads.adclarity.com"
 _thread_local = threading.local()
 _host_semaphores: dict[str, threading.Semaphore] = {}
 _host_sem_lock = threading.Lock()
+_meta_scrape_sem = threading.Semaphore(2)
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov", ".m4v"}
@@ -171,6 +174,16 @@ def _host_request_slot(url: str):
         yield
     finally:
         sem.release()
+
+
+@contextmanager
+def _meta_scrape_slot():
+    """Limit concurrent Facebook/Instagram page scrapes."""
+    _meta_scrape_sem.acquire()
+    try:
+        yield
+    finally:
+        _meta_scrape_sem.release()
 
 
 def is_tiktok_cdn_url(url: str) -> bool:
@@ -928,6 +941,13 @@ def resolve_thumbnail_with_client(
     cached = _existing_cached_thumb(cache_dir, key)
     if cached:
         return cached, None, None
+
+    if is_meta_page_url(url):
+        with _meta_scrape_slot():
+            image_url, detail = first_meta_image_url(url, client)
+        if image_url:
+            return None, None, image_url
+        return None, detail or "No Facebook/Instagram creative image found", None
 
     if _is_serverless():
         remote, detail = _serverless_remote_thumbnail(client, url)
